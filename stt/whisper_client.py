@@ -1,7 +1,45 @@
+import ctypes
+import importlib.util
 import os
+from pathlib import Path
 
 import numpy as np
-from faster_whisper import WhisperModel
+
+
+def _preload_cuda12_libs() -> None:
+    """CTranslate2はCUDA 12版のcuBLAS/cuDNNを要求するが、torchがCUDA 13版を入れるため
+    pip版の nvidia-cublas-cu12 / nvidia-cudnn-cu12 を先にロードしておく (LD_LIBRARY_PATH不要にする)。"""
+    for package, lib_names in (
+        ("nvidia.cublas", ("libcublasLt.so.12", "libcublas.so.12")),
+        ("nvidia.cudnn", ("libcudnn.so.9",)),
+    ):
+        try:
+            spec = importlib.util.find_spec(package)
+        except ModuleNotFoundError:
+            continue
+        if spec is None or not spec.submodule_search_locations:
+            continue
+        lib_dir = Path(next(iter(spec.submodule_search_locations))) / "lib"
+        for lib_name in lib_names:
+            if (lib_dir / lib_name).exists():
+                ctypes.CDLL(str(lib_dir / lib_name), mode=ctypes.RTLD_GLOBAL)
+
+
+_preload_cuda12_libs()
+
+from faster_whisper import WhisperModel  # noqa: E402
+
+# 日本語Whisperが雑音や無音に対して出しがちな定型の誤認識 (動画字幕の学習データ由来)
+HALLUCINATION_PHRASES = {
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございました。",
+    "ご清聴ありがとうございました",
+    "ご清聴ありがとうございました。",
+    "チャンネル登録よろしくお願いします",
+    "チャンネル登録よろしくお願いします。",
+    "おやすみなさい",
+    "おやすみなさい。",
+}
 
 
 class WhisperClient:
@@ -12,5 +50,16 @@ class WhisperClient:
         self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
     def transcribe(self, pcm_16k: np.ndarray) -> str:
-        segments, _ = self._model.transcribe(pcm_16k, language="ja", beam_size=5)
-        return "".join(segment.text for segment in segments).strip()
+        segments, _ = self._model.transcribe(
+            pcm_16k, language="ja", beam_size=5, condition_on_previous_text=False
+        )
+        texts = []
+        for segment in segments:
+            # 雑音・無音をWhisperが発話と取り違えた (幻聴) とみられる区間は捨てる
+            if segment.no_speech_prob > 0.6 and segment.avg_logprob < -0.5:
+                continue
+            text = segment.text.strip()
+            if text in HALLUCINATION_PHRASES:
+                continue
+            texts.append(text)
+        return "".join(texts).strip()

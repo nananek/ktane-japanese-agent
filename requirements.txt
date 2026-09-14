@@ -1,6 +1,9 @@
-discord.py>=2.4.0
+discord.py[voice]>=2.4.0
 discord-ext-voice-recv
 faster-whisper
+# CTranslate2 (faster-whisper) 用のCUDA 12ライブラリ。torchがCUDA 13版を入れても共存させる
+nvidia-cublas-cu12
+nvidia-cudnn-cu12>=9,<10
 torch
 silero-vad
 openai
