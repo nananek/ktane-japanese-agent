@@ -1,0 +1,9 @@
+discord.py>=2.4.0
+discord-ext-voice-recv
+faster-whisper
+torch
+silero-vad
+openai
+httpx
+python-dotenv
+numpy

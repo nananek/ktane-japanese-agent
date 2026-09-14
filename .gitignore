@@ -1,0 +1,18 @@
+# マニュアル書き起こし (著作権配慮のため非公開・除外)
+knowledge/
+
+# 環境変数・秘密情報
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS/エディタ
+.DS_Store
+
+# Claude Codeランタイム
+.claude/
