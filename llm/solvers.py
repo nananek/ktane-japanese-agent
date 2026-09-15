@@ -207,6 +207,8 @@ def solve_memory(state: BombState, display: int, buttons: list[int], stage: int 
 # ---------------------------------------------------------------- 順番ワイヤ
 
 WIRE_COLORS = {"red": "赤", "blue": "青", "black": "黒"}
+# 順番ワイヤの1パネルあたりの左の番号の数
+WIRE_SEQUENCE_PANEL_SIZE = 3
 WIRE_SECTION_RE = re.compile(r"^## (赤|青|黒)いワイヤの出現回数\n(.*?)(?=^## |\Z)", re.M | re.S)
 WIRE_ROW_RE = re.compile(r"^\| ([一二三四五六七八九])番目 \| ([ABC](?:か[ABC])*) \|$", re.M)
 
@@ -225,19 +227,31 @@ def load_wire_sequence_rules() -> dict[str, dict[int, set[str]]]:
     }
 
 
-def solve_wire_sequence(state: BombState, panel: int, wires: list[dict]) -> str:
+def solve_wire_sequence(state: BombState, panel: int | None, wires: list[dict]) -> str:
     rules = load_wire_sequence_rules()
     parsed = []
+    sources = []
     for wire in wires:
         color, target = wire.get("color"), str(wire.get("target", "")).upper()
         if color not in WIRE_COLORS or target not in ("A", "B", "C"):
             return "各ワイヤは color (red/blue/black) と target (A/B/C) で指定してください。"
         parsed.append((color, target))
+        sources.append(wire.get("source"))
 
-    # 同じパネルを言い直した場合も二重に数えないよう、パネル単位で置き換えてから数え直す
+    # パネル番号はDefuserに聞かない (聞き返しが伝わらず足踏みした)。左の番号はパネルをまたいで続き番号 (1〜3がパネル1、
+    # 4〜6がパネル2…) なので、番号が分かればそこから決める。言い直しも同じパネルとして置き換わる
+    source_panels = {(int(source) - 1) // WIRE_SEQUENCE_PANEL_SIZE + 1 for source in sources if source}
+    if len(source_panels) > 1:
+        return f"左の番号が複数のパネルにまたがっています: {[s for s in sources if s]}。1枚のパネル分ずつ指定してください。"
+    if source_panels:
+        panel = source_panels.pop()
+    elif panel is None:
+        # 番号が分からなければ、直前のパネルと同じ内容なら言い直し、違えば次のパネルとみなす
+        last = max(state.wire_sequence_panels, default=0)
+        panel = last if last and state.wire_sequence_panels[last] == parsed else last + 1
+    # 同じパネルを言い直した場合も二重に数えないよう、パネル単位で置き換えてから数え直す。
+    # 前のパネルを聞き返されただけのこともあるので、後のパネルの記録は残す
     state.wire_sequence_panels[panel] = parsed
-    for later_panel in [n for n in state.wire_sequence_panels if n > panel]:
-        del state.wire_sequence_panels[later_panel]
     counts = {color: 0 for color in WIRE_COLORS}
     for earlier_panel in sorted(n for n in state.wire_sequence_panels if n < panel):
         for color, _ in state.wire_sequence_panels[earlier_panel]:
@@ -253,8 +267,13 @@ def solve_wire_sequence(state: BombState, panel: int, wires: list[dict]) -> str:
         verdict = "切る" if target in cut_targets else "切らない"
         counts_at.append(counts[color])
         results.append(f"{index}本目({WIRE_COLORS[color]}→{target}, {WIRE_COLORS[color]}{counts[color]}本目): {verdict}")
-    cut = [str(i) for i, (color, target) in enumerate(parsed, 1) if target in rules[color].get(counts_at[i - 1], set())]
-    speech = f"{'、'.join(cut)}本目を切って、次のパネルへ。" if cut else "どれも切らずに次のパネルへ。"
+    # 「2本目」はDefuserが左の番号と取り違えるため、左の番号 (なければ接続先) と色で伝える
+    cut = [
+        f"{source}から{target}の{WIRE_COLORS[color]}" if source else f"{target}につながる{WIRE_COLORS[color]}"
+        for (color, target), source, count in zip(parsed, sources, counts_at)
+        if target in rules[color].get(count, set())
+    ]
+    speech = f"{'と、'.join(cut)}を切って、次のパネルへ。" if cut else "どれも切らずに次のパネルへ。"
     return SolverResult(f"パネル{panel}: " + "、".join(results), speech)
 
 

@@ -169,21 +169,28 @@ def build_tools() -> list[dict]:
         },
         {
             "name": "solve_wire_sequence",
-            "description": "順番ワイヤで、パネルの各ワイヤを切るかどうかを求める。色ごとの出現回数はパネルをまたいでツール側で数える。自分で判定せず必ずこのツールを使うこと。",
+            "description": (
+                "順番ワイヤで、パネルの各ワイヤを切るかどうかを求める。色ごとの出現回数とパネルの枚数はツール側で数える。"
+                "自分で判定せず必ずこのツールを使うこと。パネル番号はDefuserに聞かないこと。"
+                "結果は「3からBの青を切って」のように左の番号で伝えるので、「N本目」と言い換えないこと。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "panel": {"type": "integer", "minimum": 1, "description": "何枚目のパネルか (1から)"},
+                    "panel": {"type": ["integer", "null"], "minimum": 1,
+                              "description": "通常は null (左の番号からツールがパネルを決める)。左の番号が言われず、記録済みのパネルを言い直されたときだけそのパネル番号"},
                     "wires": {
                         "type": "array",
                         "description": "パネルのワイヤを左側の番号順に",
                         "items": {
                             "type": "object",
                             "properties": {
+                                "source": {"type": ["integer", "null"], "minimum": 1,
+                                           "description": "左側の番号 (「2からAに赤」なら2)。パネルをまたいで続き番号になり、10以上もある。言われていなければ null"},
                                 "color": {"type": "string", "enum": ["red", "blue", "black"]},
                                 "target": {"type": "string", "enum": ["A", "B", "C"], "description": "右側の接続先"},
                             },
-                            "required": ["color", "target"],
+                            "required": ["source", "color", "target"],
                         },
                     },
                 },
@@ -355,7 +362,8 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
         elif name == "solve_button":
             output = solve_button(state, args["color"], str(args["label"]), args.get("strip_color"))
         elif name == "solve_wire_sequence":
-            output = solve_wire_sequence(state, int(args["panel"]), list(args["wires"]))
+            panel = args.get("panel")
+            output = solve_wire_sequence(state, None if panel is None else int(panel), list(args["wires"]))
         elif name == "solve_maze":
             output = solve_maze(list(args["circles"]), args["start"], args["goal"])
         elif name == "solve_keypad":
