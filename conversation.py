@@ -60,6 +60,7 @@ def attempt_reply(llm: LLMClient, session: BombSession, text: str) -> ReplyAttem
     """
     user_message = {"role": "user", "content": text}
     state = copy.deepcopy(session.state)
+    state.age_pending_solver()
     try:
         result = llm.reply(build_system_prompt(state), [*session.history, user_message], session.session_id, state)
     except Exception:

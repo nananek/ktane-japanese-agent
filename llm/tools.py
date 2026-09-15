@@ -4,12 +4,16 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-from .bomb_state import INDICATORS, PORTS, BombState
+from .bomb_state import INDICATORS, PORTS, BombState, PendingSolver
 from .manual import MODULE_IDS, load_module_manual
 from .solvers import (
+    WOF_UNKNOWN_BUTTON,
     SolverResult,
+    is_known,
     keypad_symbol_ids,
+    load_complicated_wire_rules,
     solve_button,
+    solve_complicated_wires,
     solve_keypad,
     solve_maze,
     solve_memory,
@@ -17,6 +21,7 @@ from .solvers import (
     solve_whos_on_first,
     solve_wire_sequence,
     solve_wires,
+    wof_display_readings,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,8 @@ GAME_END_SPEECH = {
     "中断": "ゲームを中断したよ。",
 }
 BUTTON_LABELS = ("中止", "起爆", "長押し", "押す", "その他")
+# 爆弾の情報が足りないと判定を保留するソルバー。聞き返した情報が記録されたらその場で判定し直す
+PENDABLE_SOLVERS = ("solve_wires", "solve_button", "solve_complicated_wires")
 
 
 @dataclass
@@ -67,6 +74,7 @@ def build_tools() -> list[dict]:
             "name": "update_bomb_info",
             "description": (
                 "判明した爆弾の情報を記録する。Defuserが爆弾の情報を言ったら必ず呼ぶこと。"
+                "ソルバーが聞き返した情報を記録すると、そのソルバーの判定を自動でやり直して結果を返すので、ソルバーを呼び直さなくてよい。"
                 "Defuserが言及していない項目は必ず null にすること (推測で空配列や0を入れない)。"
             ),
             "parameters": {
@@ -84,10 +92,13 @@ def build_tools() -> list[dict]:
                                          "description": "点灯していないインジケーターすべて。「インジケーターはない」などと言われたら空配列 []、触れていなければ null"},
                     "ports": {"type": ["array", "null"], "items": {"type": "string", "enum": list(PORTS)},
                               "description": "ついているポートすべて。「ポートはない」などと言われたら空配列 []、ポートに触れていなければ null"},
-                    "strikes": {"type": ["integer", "null"], "minimum": 0, "description": "現在のミス回数。未言及なら null"},
+                    "strikes": {"type": ["integer", "null"], "minimum": 0,
+                                "description": "Defuserが「ミスは合計2回」「ストライクが2つ」のようにミス回数の合計を明言したときだけ、その数。それ以外は null"},
+                    "strike_occurred": {"type": ["boolean", "null"],
+                                        "description": "Defuserがミスの発生を報告したら true (「ミス」「ミス1回」「ミスった」「ストライク」など、合計と明言していないもの)。記録済みのミス数に1を足す。それ以外は null"},
                 },
                 "required": ["serial_number", "serial_last_digit_odd", "batteries", "lit_indicators",
-                             "not_lit_indicators", "unlit_indicators", "ports", "strikes"],
+                             "not_lit_indicators", "unlit_indicators", "ports", "strikes", "strike_occurred"],
             },
         },
         {
@@ -110,7 +121,7 @@ def build_tools() -> list[dict]:
                 "ワイヤモジュール (3〜6本の単色ワイヤ) で切るワイヤを求める。自分で判定せず必ずこのツールを使うこと。"
                 "Defuserから全ワイヤの色を聞いてから呼ぶこと (推測した色で呼ばない)。"
                 "判定に足りない爆弾の情報があれば、答えに影響するものだけを返す。"
-                "その答えが来たら、先に update_bomb_info で記録してから呼び直すこと。"
+                "その答えは update_bomb_info で記録すれば、この判定が自動でやり直される。"
             ),
             "parameters": {
                 "type": "object",
@@ -126,9 +137,8 @@ def build_tools() -> list[dict]:
             "description": (
                 "ボタンモジュールで押してすぐ離すか押し続けるかを求める。押し続ける場合は帯の色ごとの離すタイミングをまとめて返すので、帯の色を聞き返す必要はない。"
                 "自分で判定せず必ずこのツールを使うこと。判定に足りない爆弾の情報があれば、答えに影響するものだけを返す。"
-                "Defuserからボタンの色と文字を聞いてから呼ぶこと。"
-                "聞き返した爆弾の情報 (電池の本数・インジケーターなど) の答えが来たら、その応答で必ず先に update_bomb_info を呼んで"
-                "記録してから呼ぶこと (記録しないと同じ質問を繰り返すことになる)。"
+                "ボタンの色と文字が分かったら、確認の聞き返しをせずにすぐ呼ぶこと。"
+                "聞き返した爆弾の情報 (電池の本数・インジケーターなど) の答えは update_bomb_info で記録すれば、この判定が自動でやり直される。"
             ),
             "parameters": {
                 "type": "object",
@@ -195,31 +205,93 @@ def build_tools() -> list[dict]:
             },
         },
     ]
+    if load_complicated_wire_rules()[0]:
+        tools.append({
+            "name": "solve_complicated_wires",
+            "description": (
+                "複雑ワイヤ (縦向きに並ぶワイヤで、上にLED・下に★印の場所があり、縞模様のワイヤもある) で切るワイヤを求める。"
+                "自分で判定せず必ずこのツールを使い、マニュアルの条件 (シリアルが偶数なら、など) をDefuserにそのまま伝えないこと。"
+                "Defuserは本数・色・LED・★を何回にも分けて言うので、聞き取れた分だけを入れてその都度呼ぶこと (言われていない項目は null)。"
+                "ツールがそれまでの分と合わせて記録し、足りない項目だけを聞き返す文を返すので、自分で覚えたり最初から聞き直したりしないこと。"
+                "記録済みの内容は「現在判明している爆弾の情報」に載る。"
+                "判定に足りない爆弾の情報があれば答えに影響するものだけを返し、その答えを update_bomb_info で記録すれば判定が自動でやり直される。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "wire_count": {"type": ["integer", "null"], "minimum": 1, "maximum": 6,
+                                   "description": "ワイヤの本数。この発言で言われていなければ null"},
+                    "wires": {
+                        "type": "array", "maxItems": 6,
+                        "description": "この発言で分かったワイヤの項目だけ (なければ空配列)。色を左から順に並べて言われたら1本目から順に",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "position": {"type": "integer", "minimum": 1, "maximum": 6, "description": "左から何本目か"},
+                                "colors": {"type": ["array", "null"], "minItems": 1, "maxItems": 2,
+                                           "items": {"type": "string", "enum": ["red", "blue", "white"]},
+                                           "description": "ワイヤの色。縞模様 (縒り線) なら2色とも。言われていなければ null"},
+                                "led": {"type": ["boolean", "null"], "description": "このワイヤの上のLEDが点灯しているか。言われていなければ null"},
+                                "star": {"type": ["boolean", "null"], "description": "このワイヤの下に★印があるか。言われていなければ null"},
+                            },
+                            "required": ["position", "colors", "led", "star"],
+                        },
+                    },
+                    "lit_led_positions": {
+                        "type": ["array", "null"], "items": {"type": "integer", "minimum": 1, "maximum": 6},
+                        "description": (
+                            "「LEDは右の2つが点灯」のように点灯しているLEDをまとめて言われたとき、点灯している位置すべて (ほかは消灯とみなす)。"
+                            "位置は本数から数える (6本で「右の2つ」なら [5, 6])。「LEDは全部消えている」なら []。言われていなければ null"
+                        ),
+                    },
+                    "star_positions": {
+                        "type": ["array", "null"], "items": {"type": "integer", "minimum": 1, "maximum": 6},
+                        "description": "★印のある位置をまとめて言われたとき、その位置すべて (ほかはなし)。「★はない」なら []。言われていなければ null",
+                    },
+                },
+                "required": ["wire_count", "wires", "lit_led_positions", "star_positions"],
+            },
+        })
     positions, priorities = load_whos_on_first()
     if positions:
         tools.append({
             "name": "solve_whos_on_first",
             "description": (
                 "表比較 (Who's on First) のステージごとに押すボタンを求める。自分で判定せず必ずこのツールを使うこと。"
-                "表示語は同じ読みで漢字の違うもの (大正/対照/対称/大賞、解/回/快/開、導/同/動 など) があり、"
-                "漢字が確定していなければ同じ読みの候補をすべて入れること。押すボタンが候補で変わる場合だけ、"
-                "ツールが漢字を聞き返す文を返す。ボタンの文字「残り」「えーと」「なし」なども普通の言葉ではなく文字として扱う。"
+                "表示語は同じ読みで漢字の違うもの (かい: 解/回/下位/快/開、たいしょう: 大正/対照/対称/大賞、"
+                "どう: 導/同/動/どう/どう？、さい: 才/再/最) があり、音声認識では漢字の説明も崩れるので、"
+                "漢字が確定していなければ (kanji_confirmed=false)、ツールが同じ読みの候補を自動で広げ、"
+                "押すボタンが変わる場合だけ漢字を聞き返す文を返す。"
+                "漢字の説明がはっきりしなくても自分で聞き返さず、聞こえた漢字か読みを入れてすぐ呼ぶこと。"
+                "ボタンの文字は聞き取れたとおりに入れ、聞き取れない位置は「不明」にすること (答えに影響する位置だけツールが聞き返す)。"
+                "ボタンの文字「残り」「えーと」「なし」なども普通の言葉ではなく文字として扱う。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "display_candidates": {
                         "type": "array", "minItems": 1,
-                        "items": {"type": "string", "enum": list(positions)},
-                        "description": "ディスプレーの表示語の候補 (何も表示されていなければ「空欄」)",
+                        "items": {"type": "string", "enum": list(dict.fromkeys([*positions, *wof_display_readings()]))},
+                        "description": "ディスプレーの表示語 (何も表示されていなければ「空欄」)。漢字が分からなければ読み (かい など)",
                     },
                     "buttons": {
                         "type": "array", "minItems": 6, "maxItems": 6,
-                        "items": {"type": "string", "enum": list(priorities)},
+                        "items": {"type": "string", "enum": [*priorities, WOF_UNKNOWN_BUTTON]},
                         "description": "6つのボタンの文字を 左上・右上・左中・右中・左下・右下 の順に",
                     },
+                    "kanji_confirmed": {
+                        "type": "boolean",
+                        "description": (
+                            "漢字が1つに決まっているときだけ true にして、その漢字だけを display_candidates に入れる。"
+                            "true にしてよいのは、ツールの「表示の漢字は、〜、どれ？」にDefuserが答えたときと、"
+                            "Defuserの漢字の説明が意味の通る言葉のまま聞き取れていて1つの漢字を指しているとき"
+                            " (例: 「コントラストの対照」→対照、「下の位」→下位、「開くの開」→開)。"
+                            "説明が崩れて意味の通らない言葉になっている (例: 「心領位の回」「開かなってから」) か、"
+                            "説明がないときは false"
+                        ),
+                    },
                 },
-                "required": ["display_candidates", "buttons"],
+                "required": ["display_candidates", "buttons", "kanji_confirmed"],
             },
         })
     symbol_ids = keypad_symbol_ids()
@@ -257,18 +329,27 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
     logger.info("tool call: %s %s", name, arguments)
     try:
         args = json.loads(arguments or "{}")
+        if name == "update_bomb_info":
+            return _record_bomb_info(state, args, log)
+        # 情報の記録以外のツールが呼ばれたら、保留していた判定の話からは離れたとみなす
+        state.pending_solver = None
         if name == "get_module_manual":
             log.consulted_modules.append(args["module"])
             return load_module_manual(args["module"])
-        if name == "update_bomb_info":
-            output = _update_bomb_info(state, args)
-        elif name == "solve_memory":
+        if name == "solve_memory":
             stage = None if args.get("stage") is None else int(args["stage"])
             output = solve_memory(state, int(args["display"]), [int(b) for b in args["buttons"]], stage)
         elif name == "end_game":
             output = _end_game(state, str(args["result"]))
         elif name == "solve_whos_on_first":
-            output = solve_whos_on_first(list(args["display_candidates"]), list(args["buttons"]))
+            output = solve_whos_on_first(
+                list(args["display_candidates"]), list(args["buttons"]), bool(args.get("kanji_confirmed"))
+            )
+        elif name == "solve_complicated_wires":
+            output = solve_complicated_wires(
+                state, args.get("wire_count"), list(args.get("wires") or []),
+                args.get("lit_led_positions"), args.get("star_positions"),
+            )
         elif name == "solve_wires":
             output = solve_wires(state, list(args["colors"]))
         elif name == "solve_button":
@@ -285,6 +366,8 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
         return f"引数が不正です ({e}): {arguments}"
     if isinstance(output, SolverResult):
         log.final_speech = output.speech
+        if output.missing and name in PENDABLE_SOLVERS:
+            state.pending_solver = PendingSolver(name, arguments, list(output.missing))
         output = output.text
     else:
         log.final_speech = None
@@ -297,6 +380,20 @@ def _end_game(state: BombState, result: str) -> SolverResult | str:
         return f"result は {', '.join(GAME_RESULTS)} のどれかで指定してください。"
     state.game_result = result
     return SolverResult(f"ゲーム終了を記録しました: {result}", GAME_END_SPEECH[result] + "次の爆弾は ktane-newbomb で。")
+
+
+def _record_bomb_info(state: BombState, args: dict, log: ToolLog) -> str:
+    output = _update_bomb_info(state, args)
+    log.final_speech = None
+    log.solver_outputs.append(output)
+    pending = state.pending_solver
+    if pending is None or not any(is_known(state, name) for name in pending.missing):
+        return output
+    # ソルバーが聞き返した情報の答えなら、LLMにソルバーを呼び直させる往復 (約2秒) を待たずにその場で判定し直す
+    logger.info("pending solver rerun: %s %s", pending.name, pending.arguments)
+    state.pending_solver = None
+    result = run_tool(pending.name, pending.arguments, state, log)
+    return f"{output}\n\n保留していた {pending.name} をこの情報で判定し直しました: {result}"
 
 
 def _update_bomb_info(state: BombState, args: dict) -> str:
@@ -314,4 +411,7 @@ def _update_bomb_info(state: BombState, args: dict) -> str:
         state.not_lit_indicators |= set(args["not_lit_indicators"])
     if args.get("strikes") is not None:
         state.strikes = int(args["strikes"])
+    elif args.get("strike_occurred"):
+        # 「ミス1回」は合計なのか1回増えたのか区別がつかず、2回目も1回と記録していたため、ミスの報告は常に1回ずつ足す
+        state.strikes = (state.strikes or 0) + 1
     return "記録しました。現在の爆弾情報:\n" + state.summary()

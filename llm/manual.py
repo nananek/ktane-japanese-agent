@@ -15,14 +15,14 @@ class ModuleInfo:
 
 
 MODULES: tuple[ModuleInfo, ...] = (
-    ModuleInfo("wires", "ワイヤ", "3〜6本の色付きワイヤが横に並ぶ。「線」「コード」とも呼ばれる"),
+    ModuleInfo("wires", "ワイヤ", "3〜6本の単色のワイヤが横向きに並ぶ (上下に積み重なる)。LEDや★印はない。「線」「コード」とも呼ばれる"),
     ModuleInfo("the-button", "ボタン", "ラベル付きの大きな色付きボタンが1つ。押し続けると右に色の帯が光る"),
     ModuleInfo("keypads", "キーパッド", "見慣れない記号が書かれた4つのキー。「キーボード」「記号」とも呼ばれる"),
     ModuleInfo("simon-says", "サイモンゲーム", "赤・青・緑・黄の4色のボタンが順に光る"),
     ModuleInfo("whos-on-first", "表比較 (Who's on First)", "上の表示窓に単語、下に単語の書かれた6つのボタン"),
     ModuleInfo("memory", "記憶", "大きな数字の表示と、数字の書かれた4つのボタン。ステージが5段階"),
     ModuleInfo("morse-code", "モールス信号", "点滅するランプ、周波数の表示と左右の矢印、TXボタン"),
-    ModuleInfo("complicated-wires", "複雑ワイヤ", "ワイヤの上にLED、下に★印があることがある。縞模様のワイヤもある"),
+    ModuleInfo("complicated-wires", "複雑ワイヤ", "縦向きのワイヤが左右に並び、各ワイヤの上にLED、下に★印の場所がある。白・赤・青と、その縞模様 (縒り線) のワイヤ"),
     ModuleInfo("wire-sequences", "順番ワイヤ", "左の数字と右のアルファベットを結ぶワイヤが数ページに分かれている"),
     ModuleInfo("mazes", "迷路", "6×6のマス目、緑の丸印2つ、白い点(現在地)と赤い三角(ゴール)"),
     ModuleInfo("passwords", "パスワード", "5文字の表示窓で、各文字を上下のボタンで切り替える"),

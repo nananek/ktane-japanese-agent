@@ -25,6 +25,8 @@ class SolverResult:
 
     text: str
     speech: str | None = None
+    # 判定に足りない爆弾の情報の名前。記録されたら同じ呼び出しで判定し直せるようにする
+    missing: tuple[str, ...] = ()
 
 
 def _read(file_name: str) -> str | None:
@@ -420,9 +422,24 @@ def _serial_odd(state: BombState) -> bool | None:
 def _missing_message(names: list[str]) -> SolverResult:
     items = "、".join(UNKNOWN_VARIABLE_LABELS.get(n, n) for n in names)
     return SolverResult(
-        f"判定には次の情報が必要です: {items}。これらをまとめて1回で聞き、update_bomb_info で記録してから再度呼んでください。",
+        f"判定には次の情報が必要です: {items}。これらをまとめて1回で聞き、答えを update_bomb_info で記録してください"
+        " (記録するとこの判定を自動でやり直すので、呼び直さなくてよい)。",
         "、".join(QUESTION_LABELS.get(n, UNKNOWN_VARIABLE_LABELS.get(n, n)) for n in names) + "？",
+        missing=tuple(names),
     )
+
+
+def is_known(state: BombState, name: str) -> bool:
+    """_missing_message で聞いた情報が記録済みか。"""
+    if name == "serial_odd":
+        return _serial_odd(state) is not None
+    if name == "batteries":
+        return state.batteries is not None
+    if name == "parallel":
+        return state.ports is not None
+    if name.startswith("lit_"):
+        return state.lit_indicators is not None or name.removeprefix("lit_") in state.not_lit_indicators
+    return False
 
 
 # ---------------------------------------------------------------- ワイヤ
@@ -563,6 +580,148 @@ def solve_button(state: BombState, color: str, label: str, strip_color: str | No
     return SolverResult(f"帯が{strip_color}なので、タイマーのどこかの桁に{digit}が表示されたときに離す。", f"タイマーに{digit}が出たら離して。")
 
 
+# ---------------------------------------------------------------- 複雑ワイヤ
+
+CW_ROW_RE = re.compile(r"^\| (あり|なし) \| (あり|なし) \| (あり|なし) \| (あり|なし) \| ([A-Z]) \|$", re.M)
+CW_CODE_RE = re.compile(r"^\| ([A-Z]) \| (.+?) \|$", re.M)
+CW_BATTERY_RE = re.compile(r"バッテリーが([一二三四五六七八九\d])本以上")
+UNKNOWN_VARIABLE_LABELS["parallel"] = "パラレルポートがあるか"
+QUESTION_LABELS["parallel"] = "パラレルポートはある"
+ORDINALS = ("1本目", "2本目", "3本目", "4本目", "5本目", "6本目")
+
+
+def load_complicated_wire_rules() -> tuple[dict[tuple[bool, bool, bool, bool], str], dict[str, str]]:
+    """complicated-wires.md を ({(赤, 青, ★, LED): 指示コード}, {指示コード: 意味}) として返す。未配置なら空。"""
+    text = _read("complicated-wires.md")
+    if text is None:
+        return {}, {}
+    table = {
+        tuple(cell == "あり" for cell in cells): code
+        for *cells, code in CW_ROW_RE.findall(text)
+    }
+    return table, dict(CW_CODE_RE.findall(text))
+
+
+def _cw_should_cut(meaning: str, env: dict) -> bool:
+    if "切らない" in meaning:
+        return False
+    if "偶数" in meaning:
+        return not env["serial_odd"]
+    if "パラレル" in meaning:
+        return env["parallel"]
+    if battery := CW_BATTERY_RE.search(meaning):
+        count = battery.group(1)
+        return env["batteries"] >= KANJI_ORDINALS.get(count, int(count) if count.isdigit() else 0)
+    return "切る" in meaning
+
+
+def _record_complicated_wires(
+    state: BombState, wire_count: int | None, wires: list[dict], marks: dict[str, list[int] | None]
+) -> str | None:
+    """聞き取れた分だけを状態に積み上げる。入力が不正ならその説明を返す。"""
+    if wire_count is not None:
+        if state.complicated_wire_count not in (None, wire_count):
+            # 本数が変わったら別のモジュールか言い直しなので、それまでの記録は捨てる
+            state.complicated_wires.clear()
+            state.complicated_marks.clear()
+        state.complicated_wire_count = wire_count
+    for wire in wires:
+        entry = state.complicated_wires.setdefault(int(wire["position"]), {})
+        if wire.get("colors"):
+            entry["colors"] = list(wire["colors"])
+        for key in ("led", "star"):
+            if wire.get(key) is not None:
+                entry[key] = bool(wire[key])
+    for key, positions in marks.items():
+        if positions is None:
+            continue
+        # まとめて言い直された内容を優先する
+        state.complicated_marks[key] = {int(p) for p in positions}
+        for entry in state.complicated_wires.values():
+            entry.pop(key, None)
+    count = state.complicated_wire_count
+    positions = set(state.complicated_wires) | {p for ps in state.complicated_marks.values() for p in ps}
+    if count is not None and any(not 1 <= p <= count for p in positions):
+        return f"{count}本の複雑ワイヤに対して範囲外の位置があります: {sorted(positions)}。位置を左から1〜{count}で指定し直してください。"
+    return None
+
+
+def _positions_label(positions: list[int], count: int) -> str:
+    return "" if len(positions) == count else "と".join(ORDINALS[p - 1] for p in positions) + "の"
+
+
+def solve_complicated_wires(
+    state: BombState,
+    wire_count: int | None = None,
+    wires: list[dict] = (),
+    lit_led_positions: list[int] | None = None,
+    star_positions: list[int] | None = None,
+) -> SolverResult | str:
+    table, meanings = load_complicated_wire_rules()
+    error = _record_complicated_wires(state, wire_count, list(wires), {"led": lit_led_positions, "star": star_positions})
+    if error:
+        return error
+    count = state.complicated_wire_count
+    if count is None:
+        return SolverResult("複雑ワイヤの本数が分かりません。本数を聞いてください。", "ワイヤは何本？")
+
+    current = {position: state.complicated_wire(position) for position in range(1, count + 1)}
+    missing = []
+    for key, label in (("colors", "色"), ("led", "LED"), ("star", "★")):
+        positions = [position for position, wire in current.items() if key not in wire]
+        if positions:
+            missing.append(f"{_positions_label(positions, count)}{label}")
+    if missing:
+        # 分かった分は記録済みなので、足りない項目だけを聞く (最初から聞き直すと時間を失う)
+        prefix = "左から順に、" if len(missing) == 3 and not state.complicated_wires and not state.complicated_marks else ""
+        return SolverResult(
+            f"記録しました。まだ分からない項目: {'、'.join(missing)}。聞き取れた分から続けてこのツールに入れてください。",
+            f"{prefix}{'、'.join(missing)}は？",
+        )
+
+    codes = []
+    for wire in current.values():
+        colors = set(wire["colors"])
+        codes.append(table[("red" in colors, "blue" in colors, wire["star"], wire["led"])])
+
+    # 実際に出てきた指示コードの判定に要る情報だけを、未判明なら総当たりの対象にする
+    needed = {name for code in codes for name, word in (("serial_odd", "偶数"), ("parallel", "パラレル"), ("batteries", "バッテリー")) if word in meanings[code]}
+    known: dict = {}
+    unknowns: dict[str, list] = {}
+    if "serial_odd" in needed:
+        if (odd := _serial_odd(state)) is None:
+            unknowns["serial_odd"] = [False, True]
+        known["serial_odd"] = odd
+    if "parallel" in needed:
+        if state.ports is None:
+            unknowns["parallel"] = [False, True]
+        known["parallel"] = state.ports is not None and "パラレル" in state.ports
+    if "batteries" in needed:
+        if state.batteries is None:
+            thresholds = [KANJI_ORDINALS.get(n, int(n) if n.isdigit() else 0) for m in meanings.values() for n in CW_BATTERY_RE.findall(m)]
+            unknowns["batteries"] = list(range(max(thresholds, default=0) + 1))
+        known["batteries"] = state.batteries
+
+    outcomes = []
+    for assignment in _enumerate(unknowns):
+        env = {**known, **assignment}
+        outcomes.append((assignment, tuple(i for i, code in enumerate(codes) if _cw_should_cut(meanings[code], env))))
+    if len({cut for _, cut in outcomes}) > 1:
+        relevant = [
+            name for name in unknowns
+            if any(a[name] != b[name] and all(a[k] == b[k] for k in unknowns if k != name) and ca != cb
+                   for a, ca in outcomes for b, cb in outcomes)
+        ]
+        return _missing_message(relevant)
+
+    cut = outcomes[0][1]
+    detail = "、".join(f"{ORDINALS[i]}={code}" for i, code in enumerate(codes))
+    if not cut:
+        return SolverResult(f"どのワイヤも切らない (左から {detail})。", "どのワイヤも切らなくていい。")
+    targets = "と".join(ORDINALS[i] for i in cut)
+    return SolverResult(f"左から{targets}のワイヤを切る (左から {detail})。", f"左から{targets}を切って。")
+
+
 # ---------------------------------------------------------------- 表比較
 
 WOF_STEP1_RE = re.compile(r"^## ステップ1.*?\n(.*?)(?=^## )", re.M | re.S)
@@ -572,6 +731,19 @@ WOF_PRIORITY_RE = re.compile(r"^\| (.+?) \| (.+?) \|$", re.M)
 WOF_EMPTY_DISPLAY = "空欄"
 # ボタンの位置を読み上げる順番。ステップ1の「N行目-左/右」と対応させる
 WOF_POSITIONS = ("左上", "右上", "左中", "右中", "左下", "右下")
+# 聞き取れなかったボタンの文字
+WOF_UNKNOWN_BUTTON = "不明"
+# 表示語のうち読みが同じで、音声では区別できないもの (読み → {表示語: 聞き返すときの説明})。
+# マニュアルの判定データではなく日本語の読みの知識なのでコードに持つ (書き起こしの表にない語は使わない)。
+# Defuserが漢字を説明しても音声認識で崩れやすく (「開くの開」→「開かなってから」)、LLMが1つに決めつけてミスした
+WOF_HOMOPHONES = {
+    "かい": {"解": "解答の解", "回": "回数の回", "下位": "上位下位の下位", "快": "快適の快", "開": "開くの開"},
+    "たいしょう": {"大正": "大正時代の大正", "対照": "対照的の対照", "対称": "左右対称の対称", "大賞": "グランプリの大賞"},
+    "どう": {"導": "導くの導", "同": "同じの同", "動": "動くの動", "どう": "ひらがなのどう", "どう？": "はてな付きのどう"},
+    "さい": {"才": "天才の才", "再": "再びの再", "最": "最高の最"},
+}
+# 不確かなボタンをこの数より多く総当たりせず、まとめて聞き返す
+WOF_MAX_UNCERTAIN_BUTTONS = 2
 
 
 def load_whos_on_first() -> tuple[dict[str, int], dict[str, list[str]]]:
@@ -591,30 +763,111 @@ def load_whos_on_first() -> tuple[dict[str, int], dict[str, list[str]]]:
     return positions, priorities
 
 
-def solve_whos_on_first(display_candidates: list[str], buttons: list[str]) -> SolverResult | str:
+def wof_display_readings() -> list[str]:
+    """表示語の代わりに読み (ひらがな) で渡してよい語。漢字が分からないまま候補を広げさせるため。"""
+    return list(WOF_HOMOPHONES)
+
+
+def _expand_homophones(candidates: list[str], positions: dict[str, int], kanji_confirmed: bool) -> list[str]:
+    expanded = []
+    for candidate in candidates:
+        group = next(
+            (words for reading, words in WOF_HOMOPHONES.items() if candidate == reading or candidate in words), None
+        )
+        # 読みで渡されたときは漢字が決まっていないので、確定済みでも広げる
+        if group is not None and (not kanji_confirmed or candidate not in positions):
+            expanded.extend(word for word in group if word in positions)
+        else:
+            expanded.append(candidate)
+    return list(dict.fromkeys(expanded))
+
+
+def solve_whos_on_first(
+    display_candidates: list[str], buttons: list[str], kanji_confirmed: bool = False
+) -> SolverResult | str:
     positions, priorities = load_whos_on_first()
     if len(buttons) != 6:
         return f"ボタンは {'・'.join(WOF_POSITIONS)} の順に6つ指定してください。"
-    unknown = [word for word in buttons if word not in priorities]
-    if unknown:
-        return f"表にないボタンの文字があります: {'、'.join(unknown)}。その位置のボタンの文字を聞き返してください。"
+    displays = _expand_homophones(display_candidates, positions, kanji_confirmed)
+    unknown_displays = [display for display in displays if display not in positions]
+    if unknown_displays:
+        return f"表にない表示語です: {'、'.join(unknown_displays)}。表示の文字を聞き返してください。"
 
-    outcomes: dict[str, tuple[str, str]] = {}
-    for display in dict.fromkeys(display_candidates):
-        if display not in positions:
-            return f"表にない表示語です: {display}。表示の文字を聞き返してください。"
-        read_word = buttons[positions[display]]
-        press = next((word for word in priorities[read_word] if word in buttons), None)
-        if press is None:
-            return f"「{read_word}」の優先順位リストに該当するボタンがありません。ボタンの文字を聞き返してください。"
-        outcomes[display] = (read_word, press)
+    # ボタンの文字は同じ語群 (優先順位リストに並ぶ14語) から出る。表にない文字や、ほかと別の語群の文字は聞き間違いとみなす
+    groups = {word: frozenset(order) for word, order in priorities.items()}
+    known_groups = [groups[word] for word in buttons if word in groups]
+    if not known_groups:
+        return "ボタンの文字が1つも表にありません。6つのボタンの文字を聞き返してください。"
+    group = max(set(known_groups), key=known_groups.count)
+    uncertain = [i for i, word in enumerate(buttons) if groups.get(word) != group]
+    if len(uncertain) > WOF_MAX_UNCERTAIN_BUTTONS:
+        return _wof_ask_buttons(buttons, uncertain)
 
-    presses = {press for _, press in outcomes.values()}
-    if len(presses) > 1:
-        # 同じ読みの表示語 (大正/対照/対称/大賞 など) で押すボタンが変わる。答えを分ける漢字だけを聞く
-        choices = "、".join(f"「{display}」" for display in outcomes)
-        return SolverResult(f"表示語の候補によって押すボタンが変わります: {choices}", f"表示の漢字は{choices}のどれ？")
-    press = presses.pop()
-    position = WOF_POSITIONS[buttons.index(press)]
-    detail = " / ".join(f"表示「{d}」→ {WOF_POSITIONS[positions[d]]}の「{r}」を読む" for d, (r, _) in outcomes.items())
-    return SolverResult(f"{detail} → {position}の「{press}」を押す。", f"{position}の「{press}」を押して。")
+    # 表示語の候補と、不確かなボタンに入りうる文字を総当たりし、押す位置が変わる要素だけを聞き返す
+    fill_words = [word for word in sorted(group) if word not in buttons]
+    outcomes: dict[tuple, int] = {}
+    for display, *fills in itertools.product(displays, *[fill_words] * len(uncertain)):
+        if len(set(fills)) != len(fills):
+            continue
+        filled = list(buttons)
+        for i, word in zip(uncertain, fills):
+            filled[i] = word
+        read_word = filled[positions[display]]
+        outcomes[(display, *fills)] = filled.index(next(word for word in priorities[read_word] if word in filled))
+
+    if len(set(outcomes.values())) > 1:
+        display_matters = _wof_varies(outcomes, 0)
+        buttons_matter = [i for n, i in enumerate(uncertain, 1) if _wof_varies(outcomes, n)]
+        if display_matters and not buttons_matter:
+            return _wof_ask_display(displays, positions, buttons)
+        if buttons_matter and not display_matters:
+            return _wof_ask_buttons(buttons, buttons_matter)
+        display_question = _wof_ask_display(displays, positions, buttons)
+        buttons_question = _wof_ask_buttons(buttons, buttons_matter)
+        return SolverResult(
+            f"{display_question.text} / {buttons_question.text}",
+            f"{display_question.speech}それと、{buttons_question.speech}",
+        )
+
+    press_index = next(iter(outcomes.values()))
+    position = WOF_POSITIONS[press_index]
+    notes = []
+    if len(displays) > 1:
+        notes.append(f"表示語の候補「{'/'.join(displays)}」のどれでも同じ")
+    if uncertain:
+        notes.append(f"不確かなボタン ({'、'.join(WOF_POSITIONS[i] for i in uncertain)}) は答えに影響しない")
+    note = f" ({'、'.join(notes)})" if notes else ""
+    if press_index in uncertain:
+        # 押すボタンの文字自体が聞き取れていないので、位置だけを伝える
+        return SolverResult(f"{position}のボタンを押す。{note}", f"{position}を押して。")
+    press = buttons[press_index]
+    return SolverResult(f"{position}の「{press}」を押す。{note}", f"{position}の「{press}」を押して。")
+
+
+def _wof_varies(outcomes: dict[tuple, int], index: int) -> bool:
+    """組み合わせの index 番目の要素だけを変えたときに、押す位置が変わることがあるか。"""
+    seen: dict[tuple, int] = {}
+    for key, outcome in outcomes.items():
+        rest = key[:index] + key[index + 1:]
+        if seen.setdefault(rest, outcome) != outcome:
+            return True
+    return False
+
+
+def _wof_ask_display(displays: list[str], positions: dict[str, int], buttons: list[str]) -> SolverResult:
+    descriptions = {word: text for words in WOF_HOMOPHONES.values() for word, text in words.items()}
+    choices = "、".join(descriptions.get(display, f"「{display}」") for display in displays)
+    return SolverResult(
+        f"表示語の候補によって押すボタンが変わります: {'、'.join(displays)}。表示の漢字を聞き返し、"
+        "答えを受けたら kanji_confirmed=true でその漢字だけを入れて呼び直してください。",
+        f"表示の漢字は、{choices}、どれ？",
+    )
+
+
+def _wof_ask_buttons(buttons: list[str], indices: list[int]) -> SolverResult:
+    names = "、".join(WOF_POSITIONS[i] for i in indices)
+    heard = "、".join(f"{WOF_POSITIONS[i]}「{buttons[i]}」" for i in indices)
+    return SolverResult(
+        f"表にないか、ほかのボタンと別の語群の文字です: {heard}。その位置のボタンの文字だけを聞き返してください。",
+        f"{names}のボタンの文字は？",
+    )

@@ -199,6 +199,7 @@ async def announce_opening(conv: Conversation) -> None:
     async with lock:
         sessions.get_or_create(conv.guild.id).add_assistant_message(opening_line)
         last_replies[conv.guild.id] = opening_line
+        logger.info("reply (opening): %s", opening_line)
         await conv.channel.send(f"🤖 {opening_line}")
         if conv.voice_client is not None:
             await wait_voice_encryption_ready(conv.voice_client)
@@ -257,6 +258,7 @@ async def repeat_last_reply(conv: Conversation) -> None:
     lock = utterance_locks.setdefault(conv.guild.id, asyncio.Lock())
     async with lock:
         reply = last_replies[conv.guild.id]
+        logger.info("reply (repeat): %s", reply)
         post_in_background(conv, f"🤖 {reply}")
         if conv.voice_client is not None:
             await speak(conv.voice_client, reply)
@@ -337,6 +339,8 @@ async def respond_to_pending(conv: Conversation) -> None:
                 for output in result.tool_log.solver_outputs:
                     logger.info("solver: %s", output)
                     post_in_background(conv, f"🧮 {output}")
+            # 監視中に答えの正否を確かめられるよう、読み上げる内容をログにも残す
+            logger.info("reply: %s", reply)
             post_in_background(conv, f"🤖 {reply}")
             if reply and reply != LLM_FAILURE_REPLY:
                 last_replies[conv.guild.id] = reply
