@@ -130,6 +130,13 @@ async def ktane_join(interaction: discord.Interaction) -> None:
     if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel is None:
         await interaction.response.send_message("先にボイスチャンネルに参加してください。", ephemeral=True)
         return
+    # ゲーム中の再実行は聞き取り対象の付け替えだけにして、会話や爆弾の記録は残す。
+    # 前のゲームが終わっている (終了記録が残っていると聞き取りが止まったまま) か、まだ始まっていなければ新しい爆弾にする
+    await connect_and_listen(interaction, member, new_bomb=not is_in_game(member.guild.id))
+
+
+async def connect_and_listen(interaction: discord.Interaction, member: discord.Member, new_bomb: bool) -> None:
+    """実行した人のボイスチャンネルに接続してその人の発話を聞き取る。new_bomb なら会話をリセットして開始のセリフを読む。"""
     # 接続に3秒以上かかると応答期限を過ぎるため、先に受け付けておく
     await interaction.response.defer()
 
@@ -142,11 +149,9 @@ async def ktane_join(interaction: discord.Interaction) -> None:
         # 接続済みなら再接続せず、チャンネル移動と聞き取り対象の付け替えだけ行う
         await vc.move_to(channel)
     listen_to(conv, vc, member)
-    if is_in_game(member.guild.id):
-        # ゲーム中の再実行は聞き取り対象の付け替えだけにして、会話や爆弾の記録は残す
+    if not new_bomb:
         await interaction.followup.send(f"{member.display_name} さんの発話を聞き取ります。ゲームはそのまま続けます。")
         return
-    # 前のゲームが終わっている (終了記録が残っていると聞き取りが止まったまま) か、まだ始まっていなければ新しい爆弾にする
     sessions.reset(member.guild.id)
     await interaction.followup.send(f"{channel.name} に接続しました。{member.display_name} さんの発話を聞き取ります。")
     await announce_opening(conv)
@@ -169,9 +174,19 @@ async def ktane_newbomb(interaction: discord.Interaction, force: bool = False) -
         return
 
     conv = Conversation(member.guild, interaction.channel)
+    vc = conv.voice_client
+    if vc is None:
+        # /ktane-join より先に実行された場合。音声のないまま開始のセリフを流し、join でもう一度リセットすることになるため、
+        # 実行した人がボイスチャンネルにいればそのまま参加して始める
+        if member.voice is None or member.voice.channel is None:
+            await interaction.response.send_message(
+                "botがボイスチャンネルに参加していません。ボイスチャンネルに入ってから実行してください。", ephemeral=True
+            )
+            return
+        await connect_and_listen(interaction, member, new_bomb=True)
+        return
     sessions.reset(member.guild.id)
     message = "新しい爆弾用にセッションをリセットしました。"
-    vc = conv.voice_client
     # 実行した人がbotと同じボイスチャンネルにいれば、聞き取り対象をその人に切り替える
     if vc is not None and member.voice is not None and member.voice.channel == vc.channel:
         if listening_to.get(member.guild.id) != member.id:
