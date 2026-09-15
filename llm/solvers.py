@@ -5,6 +5,7 @@ Defuserの説明を構造化 (記号ID、座標、色など) するのはLLMに�
 判定データはコードに持たず、knowledge/modules/ の書き起こしから読み取る。
 """
 
+import itertools
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -59,47 +60,77 @@ def keypad_symbol_ids() -> list[str]:
     return sorted({symbol_id for column in load_keypad_columns() for symbol_id, _, _ in column})
 
 
-def solve_keypad(symbol_ids: list[str]) -> str:
+def solve_keypad(symbol_candidates: list[list[str]]) -> SolverResult | str:
+    """記号ごとの候補IDのリストから、該当する列と押す順番を求める。
+
+    聞き取りで2択に絞れたが決めきれない記号は候補を複数渡せる。候補の組み合わせのうち
+    ほかの記号と同じ列に入るものが1通りに決まれば、聞き返さずに答えを確定させる。
+    """
     columns = load_keypad_columns()
-    wanted = set(symbol_ids)
-    if len(wanted) != len(symbol_ids):
-        return "同じ記号が重複しています。4つのキーの記号をそれぞれ特定し直してください。"
+    names = {symbol_id: name for column in columns for symbol_id, _, name in column}
+    slots = [list(dict.fromkeys(candidates)) for candidates in symbol_candidates if candidates]
 
-    candidates = [
-        (index, column) for index, column in enumerate(columns, 1)
-        if wanted <= {symbol_id for symbol_id, _, _ in column}
-    ]
-    if not candidates:
-        # 1記号だけ食い違う列があれば、その記号の特定ミスの可能性が高いので聞き返す的を示す
-        appearances = {symbol_id: appearance for column in columns for symbol_id, _, appearance in column}
-        hints = []
+    solutions: dict[tuple[int, tuple[str, ...]], list] = {}
+    for combo in itertools.product(*slots):
+        if len(set(combo)) != len(combo):
+            continue
         for index, column in enumerate(columns, 1):
-            column_ids = {symbol_id for symbol_id, _, _ in column}
-            missing = [symbol_id for symbol_id in symbol_ids if symbol_id not in column_ids]
-            if len(missing) == 1 and len(symbol_ids) > 1:
-                alternatives = "、".join(
-                    f"{char}({appearance})" for symbol_id, char, appearance in column if symbol_id not in wanted
-                )
-                hints.append(
-                    f"列{index}なら「{appearances.get(missing[0], missing[0])}」({missing[0]})以外の3つが一致する。"
-                    f"その記号は実は次のどれかではないか: {alternatives}"
-                )
-        message = "指定した記号をすべて含む列はありません。記号の特定を誤っている可能性が高いです。"
-        if hints:
-            return message + "\n" + "\n".join(hints) + "\n食い違っている記号の見た目だけを聞き返してください。"
-        return message + "自信のない記号の見た目を聞き返してください。"
-    if len(candidates) > 1:
-        numbers = "、".join(f"列{index}" for index, _ in candidates)
-        return f"候補の列が複数あります ({numbers})。残りの記号も特定してから再度呼んでください。"
+            if set(combo) <= {symbol_id for symbol_id, _, _ in column}:
+                solutions[(index, combo)] = column
 
-    index, column = candidates[0]
-    order = [(char, name) for symbol_id, char, name in column if symbol_id in wanted]
-    if len(order) < 4:
-        return f"列{index}に絞れたが記号が{len(order)}つしかない。残りの記号も聞いてから再度呼んでください。"
+    if not solutions:
+        if any(len(slot) > 1 for slot in slots):
+            return "候補をどう組み合わせても同じ列に入りません。自信のない記号の見た目を聞き返してください。"
+        return _keypad_near_miss([slot[0] for slot in slots], columns)
+
+    column_indexes = {index for index, _ in solutions}
+    if len(column_indexes) > 1 or len(solutions) > 1:
+        # 候補の選び方で列や記号が変わる。答えを分ける記号だけを聞き返す
+        differing = [
+            i for i in range(len(slots)) if len({combo[i] for _, combo in solutions}) > 1
+        ]
+        if not differing:
+            numbers = "、".join(f"列{index}" for index in sorted(column_indexes))
+            return f"候補の列が複数あります ({numbers})。残りの記号も特定してから再度呼んでください。"
+        choices = [
+            "か".join(f"「{names[symbol_id]}」" for symbol_id in sorted({combo[i] for _, combo in solutions}))
+            for i in differing
+        ]
+        return SolverResult(
+            "候補の組み合わせが複数の答えに当てはまります: " + " / ".join(choices),
+            "、".join(choices) + "、どれ？",
+        )
+
+    (index, combo), column = next(iter(solutions.items()))
+    if len(combo) < 4:
+        return f"列{index}に絞れたが記号が{len(combo)}つしかない。残りの記号も聞いてから再度呼んでください。"
+    order = [(char, name) for symbol_id, char, name in column if symbol_id in combo]
     return SolverResult(
         f"列{index}が該当。押す順番: " + " → ".join(f"{char}({name})" for char, name in order),
         "、".join(name for _, name in order) + "の順に押して。",
     )
+
+
+def _keypad_near_miss(symbol_ids: list[str], columns: list[list[tuple[str, str, str]]]) -> str:
+    """該当する列がないとき、1記号だけ食い違う列があればその記号の特定ミスとして聞き返す的を示す。"""
+    wanted = set(symbol_ids)
+    names = {symbol_id: name for column in columns for symbol_id, _, name in column}
+    hints = []
+    for index, column in enumerate(columns, 1):
+        column_ids = {symbol_id for symbol_id, _, _ in column}
+        missing = [symbol_id for symbol_id in symbol_ids if symbol_id not in column_ids]
+        if len(missing) == 1 and len(symbol_ids) > 1:
+            alternatives = "、".join(
+                f"{char}({name}, {symbol_id})" for symbol_id, char, name in column if symbol_id not in wanted
+            )
+            hints.append(
+                f"列{index}なら「{names.get(missing[0], missing[0])}」({missing[0]})以外の3つが一致する。"
+                f"その記号は実は次のどれかではないか: {alternatives}"
+            )
+    message = "指定した記号をすべて含む列はありません。記号の特定を誤っている可能性が高いです。"
+    if hints:
+        return message + "\n" + "\n".join(hints) + "\n食い違っている記号の見た目だけを聞き返してください。"
+    return message + "自信のない記号の見た目を聞き返してください。"
 
 
 # ---------------------------------------------------------------- 記憶

@@ -19,6 +19,8 @@ from .solvers import (
 
 logger = logging.getLogger(__name__)
 
+GAME_RESULTS = ("解除", "爆発", "時間切れ")
+
 
 @dataclass
 class ToolLog:
@@ -74,6 +76,20 @@ def build_tools() -> list[dict]:
                 },
                 "required": ["serial_number", "serial_last_digit_odd", "batteries", "lit_indicators",
                              "unlit_indicators", "ports", "strikes"],
+            },
+        },
+        {
+            "name": "end_game",
+            "description": (
+                "Defuserが爆弾の解除成功・爆発・時間切れを明言したときだけ呼び、ゲーム終了を記録する。"
+                "「ミスした」「失敗です」などのミス (ストライク) はゲーム終了ではないので呼ばず、update_bomb_info でミス数を記録すること。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "result": {"type": "string", "enum": list(GAME_RESULTS), "description": "ゲームの結果"},
+                },
+                "required": ["result"],
             },
         },
         {
@@ -171,12 +187,19 @@ def build_tools() -> list[dict]:
                 "キーパッドの記号IDから該当する列と押す順番を求める。記号IDはsystem promptのキーパッドの記号表で特定する。"
                 "押す順番は自分で判定せず、必ずこのツールの結果に従うこと。"
                 "Defuserが4つの記号をすべて説明してから呼ぶこと。1つの記号の説明 (例: キリル文字のZH) を複数の記号に分けないこと。"
+                "聞き取りで候補が2つ以上に絞れたが決めきれない記号は、聞き返す前にその候補をすべて入れて呼ぶこと"
+                " (ほかの記号と同じ列に入る候補が1つならツールが確定させる)。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbols": {"type": "array", "items": {"type": "string", "enum": symbol_ids},
-                                "minItems": 1, "maxItems": 4, "description": "モジュールについているキーの記号ID"},
+                    "symbols": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "キーごとの候補の記号IDのリスト。特定できた記号は候補1つ、決めきれない記号は候補を複数入れる",
+                        "items": {"type": "array", "items": {"type": "string", "enum": symbol_ids}, "minItems": 1},
+                    },
                 },
                 "required": ["symbols"],
             },
@@ -197,6 +220,8 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
         elif name == "solve_memory":
             stage = None if args.get("stage") is None else int(args["stage"])
             output = solve_memory(state, int(args["display"]), [int(b) for b in args["buttons"]], stage)
+        elif name == "end_game":
+            output = _end_game(state, str(args["result"]))
         elif name == "solve_wires":
             output = solve_wires(state, list(args["colors"]))
         elif name == "solve_button":
@@ -206,7 +231,7 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
         elif name == "solve_maze":
             output = solve_maze(list(args["circles"]), args["start"], args["goal"])
         elif name == "solve_keypad":
-            output = solve_keypad(list(args["symbols"]))
+            output = solve_keypad([[s] if isinstance(s, str) else list(s) for s in args["symbols"]])
         else:
             return f"不明なツールです: {name}"
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
@@ -218,6 +243,14 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
         log.final_speech = None
     log.solver_outputs.append(output)
     return output
+
+
+def _end_game(state: BombState, result: str) -> SolverResult | str:
+    if result not in GAME_RESULTS:
+        return f"result は {', '.join(GAME_RESULTS)} のどれかで指定してください。"
+    state.game_result = result
+    speech = "解除成功、お疲れさま。" if result == "解除" else "お疲れさま。"
+    return SolverResult(f"ゲーム終了を記録しました: {result}", speech + "次の爆弾は ktane-newbomb で。")
 
 
 def _update_bomb_info(state: BombState, args: dict) -> str:

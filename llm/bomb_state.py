@@ -17,6 +17,8 @@ class BombState:
     unlit_indicators: set[str] | None = None
     ports: set[str] | None = None
     strikes: int | None = None
+    # ゲームの結果 (解除/爆発/時間切れ)。記録されるまではゲーム中とみなし、新しい爆弾への切り替えを防ぐ
+    game_result: str | None = None
     # 記憶モジュール: ステージごとに押したボタンの (位置1〜4, ラベル)
     memory_presses: list[tuple[int, int]] = field(default_factory=list)
     # 順番ワイヤ: パネル番号 → [(色, 接続先)]。出現回数はパネルをまたいで累積するため全パネル分を保持する
@@ -50,4 +52,6 @@ class BombState:
         if self.wire_sequence_panels:
             panels = "、".join(f"パネル{n}" for n in sorted(self.wire_sequence_panels))
             lines.append(f"- 順番ワイヤで入力済み: {panels}")
+        if self.game_result is not None:
+            lines.append(f"- ゲーム終了: {self.game_result}")
         return "\n".join(lines) if lines else "(まだ何も判明していない)"

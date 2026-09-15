@@ -25,7 +25,7 @@ Discordボイスチャンネルbot。
 コードが前提にしている書き起こしの形式:
 
 - `00_bomb_features.md` — 爆弾全体のルール。毎回system promptに含める。表紙の
-  `バージョン: 1-ja` / `認証コード: 122` を読み取り、`!join`・`!newbomb` 時に読み上げる
+  `バージョン: 1-ja` / `認証コード: 122` を読み取り、`/ktane-join`・`/ktane-newbomb` 時に読み上げる
 - `<モジュールID>.md` — 各モジュールのマニュアル。LLMが `get_module_manual` ツールで必要な分だけ取得する
   (モジュールIDと見た目の特徴の一覧は `llm/manual.py`)
 - 以下は `llm/solvers.py` が解析し、表の照合・経路探索・ステージをまたぐ記録をコード側で確定させる
@@ -81,7 +81,7 @@ cp .env.example .env
   遅れる場合に下げる
 - `LLM_TIMEOUT` (省略可) — 応答待ちのタイムアウト秒数 (既定30)。超えると言い直しを促す定型文を読み上げる
 - `LLM_HEADERS` (省略可) — 追加するHTTPヘッダーをJSONオブジェクトで指定。値中の `{session_id}` は
-  爆弾セッション (`!newbomb` で更新) ごとのUUIDに置換される。
+  爆弾セッション (`/ktane-newbomb` で更新) ごとのUUIDに置換される。
   例: `{"User-Agent": "ktane-japanese-agent/0.1", "x-session-id": "{session_id}"}`
 - `VOICEVOX_SPEAKER_ID` — 使用する話者ID
 - `VOICEVOX_SPEED_SCALE` (省略可) — 読み上げの話速。1.0が標準で、既定は1.3
@@ -92,8 +92,18 @@ cp .env.example .env
 python3 bot.py
 ```
 
-Discord上で `!join` (ボイスチャンネル参加+聞き取り開始)、`!newbomb` (セッションリセット)、
-`!leave` (退出) が使える。
+Discord上でスラッシュコマンドが使える (他のbotと衝突しないよう `ktane-` 接頭辞付き)。
+
+- `/ktane-join` — 実行した人がいるボイスチャンネルに参加し、その人の発話だけを聞き取る
+- `/ktane-newbomb` — 新しい爆弾用に会話と爆弾情報をリセットする。実行した人がbotと同じボイスチャンネルに
+  いれば、聞き取り対象をその人に切り替える。解除中の誤操作を防ぐため、Defuserが「解除できました」
+  「爆発しました」「時間切れです」と伝えてゲーム終了が記録される (`end_game` ツール) までは実行できない
+  (`force: True` で強制実行)
+- ゲーム終了が記録された後は `/ktane-newbomb` を実行するまで、受け付け音・文字起こし・応答をすべて止める
+- `/ktane-leave` — ボイスチャンネルから退出する
+
+起動時に参加中の各サーバーへコマンドを登録する。botの招待URLには `bot` と `applications.commands` の
+スコープが必要 (メッセージ本文は読まないので MESSAGE CONTENT INTENT は不要)。
 
 ## 既知の要検証・要調整ポイント (Phase 1〜3で実測しながら詰める)
 
@@ -110,8 +120,8 @@ Discord上で `!join` (ボイスチャンネル参加+聞き取り開始)、`!ne
   チューニングが必要。
 - Discordは話し終わると音声パケットの送信自体を止めるため、無音フレームが届かずVADだけでは発話終了を
   判定できない。`voice/receiver.py` で発話中に0.3秒パケットが途切れたら無音を補って発話を確定させている。
-- `bot.py` の `!join` は発話者をコマンド実行者1人に固定している (`target_user_id`)。
-  複数人のDefuserに対応する場合は `TranscribingSink` の対象ユーザー絞り込みを見直す。
+- 聞き取り対象は `/ktane-join` または `/ktane-newbomb` を実行した1人に限っている (`TranscribingSink` の `target_user_id`)。
+  複数人のDefuserに対応する場合は対象ユーザーの絞り込みを見直す。
 - 読み上げ中とその直後0.3秒は聞き取りを止めている (半二重)。スピーカーから回り込んだbot自身の声を
   発話として拾わないためで、AI発話中の割り込み (barge-in) はできない。
   読み上げの最後にターン交代のチャイム (`voice/chime.py`) を鳴らし、話し始めてよい合図にしている。

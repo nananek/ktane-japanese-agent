@@ -5,9 +5,11 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 
 import discord
-from discord.ext import commands, voice_recv
+from discord import app_commands
+from discord.ext import voice_recv
 from dotenv import load_dotenv
 
 from llm.llm_client import LLMClient
@@ -26,13 +28,16 @@ dave.install()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("ktane-bot")
 
+# スラッシュコマンドだけで操作するので、メッセージ本文を読む特権インテントは不要
 intents = discord.Intents.default()
-intents.message_content = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
 sessions = SessionManager()
+# サーバーごとの聞き取り対象のユーザーID
+listening_to: dict[int, int] = {}
 # 応答の生成〜読み上げはギルドごとに1つずつ (開始時の読み上げとも重ならないように)
 utterance_locks: dict[int, asyncio.Lock] = {}
 whisper_lock = asyncio.Lock()
@@ -74,32 +79,52 @@ opening_line = (
 @bot.event
 async def on_ready() -> None:
     logger.info("Logged in as %s", bot.user)
+    # グローバル登録は反映に時間がかかるため、参加中の各サーバーに直接登録してすぐ使えるようにする
+    for guild in bot.guilds:
+        await sync_commands(guild)
 
 
-@bot.command()
-async def join(ctx: commands.Context) -> None:
-    if ctx.author.voice is None:
-        await ctx.send("先にボイスチャンネルに参加してください。")
-        return
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    await sync_commands(guild)
 
-    channel = ctx.author.voice.channel
-    vc = ctx.voice_client
-    if vc is None:
-        vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
-    else:
-        # 接続済みなら再接続せず、チャンネル移動と聞き取り対象の付け替えだけ行う
-        if vc.channel != channel:
-            await vc.move_to(channel)
-        if vc.is_listening():
-            vc.stop_listening()
+
+async def sync_commands(guild: discord.Guild) -> None:
+    tree.copy_global_to(guild=guild)
+    try:
+        synced = await tree.sync(guild=guild)
+        logger.info("スラッシュコマンドを登録しました: %s (%s)", guild.name, ", ".join(c.name for c in synced))
+    except discord.HTTPException:
+        logger.exception("スラッシュコマンドを登録できませんでした: %s", guild.name)
+
+
+@dataclass
+class Conversation:
+    """1サーバー分の会話先。応答を投稿するテキストチャンネルと、ボイス接続を持つサーバー。"""
+
+    guild: discord.Guild
+    channel: discord.abc.Messageable
+
+    @property
+    def voice_client(self) -> voice_recv.VoiceRecvClient | None:
+        return self.guild.voice_client  # type: ignore[return-value]
+
+
+def listen_to(conv: Conversation, vc: voice_recv.VoiceRecvClient, member: discord.Member) -> None:
+    """聞き取り対象を member ひとりに設定する (他の参加者の声やbotの声は拾わない)。"""
+    if vc.is_listening():
+        vc.stop_listening()
 
     def on_utterance(user_id: int, pcm_16k) -> None:
+        # ゲーム終了 (end_game) の記録後は /ktane-newbomb まで、受け付け音・文字起こし・応答をすべて止める
+        if is_game_over(guild_id):
+            return
         # 文字起こしより先に鳴らし、話し終わりを検出したことをすぐ伝える
         asyncio.run_coroutine_threadsafe(play_ack(vc), bot.loop).add_done_callback(_log_utterance_error)
-        future = asyncio.run_coroutine_threadsafe(handle_utterance(ctx, user_id, pcm_16k), bot.loop)
+        future = asyncio.run_coroutine_threadsafe(handle_utterance(conv, user_id, pcm_16k), bot.loop)
         future.add_done_callback(_log_utterance_error)
 
-    guild_id = ctx.guild.id
+    guild_id = conv.guild.id
 
     def is_muted() -> bool:
         # 読み上げ中と、読み上げ終了直後の残響が消えるまでは聞かない (半二重)
@@ -108,36 +133,86 @@ async def join(ctx: commands.Context) -> None:
         speaking = vc.is_playing() and not ack_playing.get(guild_id, False)
         return speaking or time.monotonic() - ended_at < ECHO_TAIL_SECONDS
 
-    sink = TranscribingSink(on_utterance, target_user_id=ctx.author.id, is_muted=is_muted)
-    vc.listen(sink)
-    await ctx.send(f"{channel.name} に接続しました。{ctx.author.display_name} さんの発話を待ち受けます。")
-    await announce_opening(ctx)
+    vc.listen(TranscribingSink(on_utterance, target_user_id=member.id, is_muted=is_muted))
+    listening_to[guild_id] = member.id
 
 
-@bot.command()
-async def leave(ctx: commands.Context) -> None:
-    if ctx.voice_client is not None:
-        await ctx.voice_client.disconnect()
-        await ctx.send("退出しました。")
+@tree.command(name="ktane-join", description="ボイスチャンネルに参加し、実行した人の発話を聞き取る")
+@app_commands.guild_only()
+async def ktane_join(interaction: discord.Interaction) -> None:
+    member = interaction.user
+    if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel is None:
+        await interaction.response.send_message("先にボイスチャンネルに参加してください。", ephemeral=True)
+        return
+    # 接続に3秒以上かかると応答期限を過ぎるため、先に受け付けておく
+    await interaction.response.defer()
+
+    channel = member.voice.channel
+    conv = Conversation(member.guild, interaction.channel)
+    vc = conv.voice_client
+    if vc is None:
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
+    elif vc.channel != channel:
+        # 接続済みなら再接続せず、チャンネル移動と聞き取り対象の付け替えだけ行う
+        await vc.move_to(channel)
+    listen_to(conv, vc, member)
+    await interaction.followup.send(f"{channel.name} に接続しました。{member.display_name} さんの発話を聞き取ります。")
+    await announce_opening(conv)
 
 
-@bot.command()
-async def newbomb(ctx: commands.Context) -> None:
-    sessions.reset(ctx.guild.id)
-    await ctx.send("新しい爆弾用にセッションをリセットしました。")
-    await announce_opening(ctx)
+@tree.command(name="ktane-newbomb", description="ゲーム終了後、新しい爆弾用に会話をリセットし、実行した人の発話を聞き取る")
+@app_commands.describe(force="ゲームの終了が記録されていなくても強制的にリセットする")
+@app_commands.guild_only()
+async def ktane_newbomb(interaction: discord.Interaction, force: bool = False) -> None:
+    member = interaction.user
+    assert isinstance(member, discord.Member)
+    session = sessions.get_or_create(member.guild.id)
+    # 解除中に誤って実行して会話や爆弾の記録を失う事故を防ぐため、終了 (解除/爆発/時間切れ) が記録されるまでは断る。
+    # 開始の読み上げしかしていない (まだ何も話していない) 場合はゲーム前とみなして許可する
+    in_game = session.state.game_result is None and any(m.get("role") == "user" for m in session.history)
+    if in_game and not force:
+        await interaction.response.send_message(
+            "まだゲーム中です。「解除できました」「爆発しました」「時間切れです」のように伝えて終了を記録してから"
+            "実行するか、force を True にして実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    conv = Conversation(member.guild, interaction.channel)
+    sessions.reset(member.guild.id)
+    message = "新しい爆弾用にセッションをリセットしました。"
+    vc = conv.voice_client
+    # 実行した人がbotと同じボイスチャンネルにいれば、聞き取り対象をその人に切り替える
+    if vc is not None and member.voice is not None and member.voice.channel == vc.channel:
+        if listening_to.get(member.guild.id) != member.id:
+            listen_to(conv, vc, member)
+            message += f"{member.display_name} さんの発話を聞き取ります。"
+    await interaction.response.send_message(message)
+    await announce_opening(conv)
 
 
-async def announce_opening(ctx: commands.Context) -> None:
+@tree.command(name="ktane-leave", description="ボイスチャンネルから退出する")
+@app_commands.guild_only()
+async def ktane_leave(interaction: discord.Interaction) -> None:
+    vc = interaction.guild.voice_client if interaction.guild else None
+    if vc is None:
+        await interaction.response.send_message("ボイスチャンネルに参加していません。", ephemeral=True)
+        return
+    await vc.disconnect()
+    listening_to.pop(interaction.guild.id, None)
+    await interaction.response.send_message("退出しました。")
+
+
+async def announce_opening(conv: Conversation) -> None:
     """マニュアルの版と認証コードを伝えて爆弾の情報を聞き、会話履歴にもExpertの発言として残す。"""
-    lock = utterance_locks.setdefault(ctx.guild.id, asyncio.Lock())
+    lock = utterance_locks.setdefault(conv.guild.id, asyncio.Lock())
     async with lock:
-        sessions.get_or_create(ctx.guild.id).add_assistant_message(opening_line)
-        last_replies[ctx.guild.id] = opening_line
-        await ctx.send(f"🤖 {opening_line}")
-        if ctx.voice_client is not None:
-            await wait_voice_encryption_ready(ctx.voice_client)
-            await speak(ctx.voice_client, opening_line)
+        sessions.get_or_create(conv.guild.id).add_assistant_message(opening_line)
+        last_replies[conv.guild.id] = opening_line
+        await conv.channel.send(f"🤖 {opening_line}")
+        if conv.voice_client is not None:
+            await wait_voice_encryption_ready(conv.voice_client)
+            await speak(conv.voice_client, opening_line)
 
 
 async def wait_voice_encryption_ready(vc: discord.VoiceClient, timeout: float = 5.0) -> None:
@@ -156,22 +231,22 @@ def _log_utterance_error(future) -> None:
         logger.error("発話の処理に失敗しました", exc_info=future.exception())
 
 
-def post_in_background(ctx: commands.Context, content: str) -> None:
+def post_in_background(conv: Conversation, content: str) -> None:
     """テキストチャンネルへの記録を待たずに投稿する。
 
     投稿は1回0.3〜0.4秒かかり、待つとその分だけ応答の読み上げが遅れるため裏で送る。
     投稿順が前後しないよう、直前の投稿が終わってから送る。
     """
-    previous = text_post_tasks.get(ctx.guild.id)
+    previous = text_post_tasks.get(conv.guild.id)
 
     async def send() -> None:
         if previous is not None:
             await asyncio.gather(previous, return_exceptions=True)
-        await ctx.send(content)
+        await conv.channel.send(content)
 
     task = asyncio.create_task(send())
     task.add_done_callback(_log_post_error)
-    text_post_tasks[ctx.guild.id] = task
+    text_post_tasks[conv.guild.id] = task
 
 
 def _log_post_error(task: asyncio.Task) -> None:
@@ -179,18 +254,22 @@ def _log_post_error(task: asyncio.Task) -> None:
         logger.error("テキストチャンネルへの投稿に失敗しました", exc_info=task.exception())
 
 
+def is_game_over(guild_id: int) -> bool:
+    return sessions.get_or_create(guild_id).state.game_result is not None
+
+
 def is_repeat_request(text: str) -> bool:
     return REPEAT_REQUEST_RE.fullmatch(re.sub(r"[\s。、,.!?！？〜…ー]", "", text)) is not None
 
 
-async def repeat_last_reply(ctx: commands.Context) -> None:
+async def repeat_last_reply(conv: Conversation) -> None:
     """直前の読み上げを繰り返す。応答中なら、その応答の読み上げが終わってから繰り返す。"""
-    lock = utterance_locks.setdefault(ctx.guild.id, asyncio.Lock())
+    lock = utterance_locks.setdefault(conv.guild.id, asyncio.Lock())
     async with lock:
-        reply = last_replies[ctx.guild.id]
-        post_in_background(ctx, f"🤖 {reply}")
-        if ctx.voice_client is not None:
-            await speak(ctx.voice_client, reply)
+        reply = last_replies[conv.guild.id]
+        post_in_background(conv, f"🤖 {reply}")
+        if conv.voice_client is not None:
+            await speak(conv.voice_client, reply)
 
 
 def is_filler(text: str) -> bool:
@@ -199,7 +278,7 @@ def is_filler(text: str) -> bool:
     return normalized in FILLER_WORDS
 
 
-async def handle_utterance(ctx: commands.Context, user_id: int, pcm_16k) -> None:
+async def handle_utterance(conv: Conversation, user_id: int, pcm_16k) -> None:
     """発話を文字起こしして未処理の発話に積み、応答生成はギルドごとの応答係にまとめて任せる。
 
     1発話ずつ応答すると、応答生成や読み上げの間に話した内容が後から1件ずつ遅れて処理されてしまう。
@@ -208,6 +287,9 @@ async def handle_utterance(ctx: commands.Context, user_id: int, pcm_16k) -> None
     # 文字起こしは発話順に1件ずつ (GPUを取り合わず、順番も入れ替わらないように)
     utterance_ended_at = time.monotonic()
     async with whisper_lock:
+        if is_game_over(conv.guild.id):
+            # 文字起こしを待つ間にゲーム終了が記録された発話も捨てる
+            return
         stt_started_at = time.monotonic()
         text = await asyncio.to_thread(whisper.transcribe, pcm_16k)
         logger.info(
@@ -220,31 +302,31 @@ async def handle_utterance(ctx: commands.Context, user_id: int, pcm_16k) -> None
             # 「ん」「えーと」だけの発話に応答すると、直前の指示を繰り返すなど往復が無駄に増える
             logger.info("filler ignored: %s", text)
             return
-        if is_repeat_request(text) and ctx.guild.id in last_replies:
+        if is_repeat_request(text) and conv.guild.id in last_replies:
             logger.info("repeat requested: %s", text)
-            post_in_background(ctx, f"🎙️ {text}")
-            task = asyncio.create_task(repeat_last_reply(ctx))
+            post_in_background(conv, f"🎙️ {text}")
+            task = asyncio.create_task(repeat_last_reply(conv))
             task.add_done_callback(_log_utterance_error)
             return
-        if not pending_texts.get(ctx.guild.id):
-            pending_since[ctx.guild.id] = utterance_ended_at
-        pending_texts.setdefault(ctx.guild.id, []).append(text)
+        if not pending_texts.get(conv.guild.id):
+            pending_since[conv.guild.id] = utterance_ended_at
+        pending_texts.setdefault(conv.guild.id, []).append(text)
     logger.info("transcript: %s", text)
-    post_in_background(ctx, f"🎙️ {text}")
+    post_in_background(conv, f"🎙️ {text}")
 
-    task = responder_tasks.get(ctx.guild.id)
+    task = responder_tasks.get(conv.guild.id)
     if task is None or task.done():
-        task = asyncio.create_task(respond_to_pending(ctx))
+        task = asyncio.create_task(respond_to_pending(conv))
         task.add_done_callback(_log_utterance_error)
-        responder_tasks[ctx.guild.id] = task
+        responder_tasks[conv.guild.id] = task
 
 
-async def respond_to_pending(ctx: commands.Context) -> None:
-    pending = pending_texts.setdefault(ctx.guild.id, [])
-    lock = utterance_locks.setdefault(ctx.guild.id, asyncio.Lock())
+async def respond_to_pending(conv: Conversation) -> None:
+    pending = pending_texts.setdefault(conv.guild.id, [])
+    lock = utterance_locks.setdefault(conv.guild.id, asyncio.Lock())
     async with lock:
         while pending:
-            session = sessions.get_or_create(ctx.guild.id)
+            session = sessions.get_or_create(conv.guild.id)
             texts: list[str] = []
             for attempt in range(MAX_REGENERATIONS + 1):
                 texts.extend(pending)
@@ -280,19 +362,22 @@ async def respond_to_pending(ctx: commands.Context) -> None:
                 session.history.extend(result.messages)
                 session.state = attempt_state
                 reply = result.text
+                if session.state.game_result is not None:
+                    # 終了の読み上げより後に届いた発話には応答しない
+                    pending.clear()
                 if result.tool_log.consulted_modules:
                     logger.info("manual lookup: %s", result.tool_log.consulted_modules)
                     names = "、".join(module_name(module_id) for module_id in result.tool_log.consulted_modules)
-                    post_in_background(ctx, f"📖 マニュアル参照: {names}")
+                    post_in_background(conv, f"📖 マニュアル参照: {names}")
                 for output in result.tool_log.solver_outputs:
                     logger.info("solver: %s", output)
-                    post_in_background(ctx, f"🧮 {output}")
-            post_in_background(ctx, f"🤖 {reply}")
+                    post_in_background(conv, f"🧮 {output}")
+            post_in_background(conv, f"🤖 {reply}")
             if reply and reply != LLM_FAILURE_REPLY:
-                last_replies[ctx.guild.id] = reply
+                last_replies[conv.guild.id] = reply
 
-            if ctx.voice_client is not None and reply:
-                await speak(ctx.voice_client, reply, since=pending_since.pop(ctx.guild.id, None))
+            if conv.voice_client is not None and reply:
+                await speak(conv.voice_client, reply, since=pending_since.pop(conv.guild.id, None))
 
 
 async def speak(vc: discord.VoiceClient, text: str, since: float | None = None) -> None:
