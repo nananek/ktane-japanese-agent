@@ -39,6 +39,10 @@ def _dave_decrypt(decoder: PacketDecoder, packet) -> bool:
     try:
         packet.decrypted_data = session.decrypt(user_id, davey.MediaType.audio, bytes(packet.decrypted_data))
     except Exception as e:
+        if "UnencryptedWhenPassthroughDisabled" in str(e):
+            # E2EEをかけずに送ってくるクライアントもある。通信経路の暗号は外れているので、そのままopusとして扱う
+            setattr(decoder, _LAST_DECRYPTED_ATTR, packet)
+            return True
         # 鍵交換 (epoch切替) 直後などは一時的に失敗しうる。そのフレームは欠損扱いにする
         global _failure_count
         _failure_count += 1

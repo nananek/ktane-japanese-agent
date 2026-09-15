@@ -156,6 +156,12 @@ async def ktane_join(interaction: discord.Interaction) -> None:
         # 接続済みなら再接続せず、チャンネル移動と聞き取り対象の付け替えだけ行う
         await vc.move_to(channel)
     listen_to(conv, vc, member)
+    if is_in_game(member.guild.id):
+        # ゲーム中の再実行は聞き取り対象の付け替えだけにして、会話や爆弾の記録は残す
+        await interaction.followup.send(f"{member.display_name} さんの発話を聞き取ります。ゲームはそのまま続けます。")
+        return
+    # 前のゲームが終わっている (終了記録が残っていると聞き取りが止まったまま) か、まだ始まっていなければ新しい爆弾にする
+    sessions.reset(member.guild.id)
     await interaction.followup.send(f"{channel.name} に接続しました。{member.display_name} さんの発話を聞き取ります。")
     await announce_opening(conv)
 
@@ -166,11 +172,9 @@ async def ktane_join(interaction: discord.Interaction) -> None:
 async def ktane_newbomb(interaction: discord.Interaction, force: bool = False) -> None:
     member = interaction.user
     assert isinstance(member, discord.Member)
-    session = sessions.get_or_create(member.guild.id)
     # 解除中に誤って実行して会話や爆弾の記録を失う事故を防ぐため、終了 (解除/爆発/時間切れ) が記録されるまでは断る。
     # 開始の読み上げしかしていない (まだ何も話していない) 場合はゲーム前とみなして許可する
-    in_game = session.state.game_result is None and any(m.get("role") == "user" for m in session.history)
-    if in_game and not force:
+    if is_in_game(member.guild.id) and not force:
         await interaction.response.send_message(
             "まだゲーム中です。「解除できました」「爆発しました」「時間切れです」のように伝えて終了を記録してから"
             "実行するか、force を True にして実行してください。",
@@ -252,6 +256,12 @@ def post_in_background(conv: Conversation, content: str) -> None:
 def _log_post_error(task: asyncio.Task) -> None:
     if not task.cancelled() and task.exception() is not None:
         logger.error("テキストチャンネルへの投稿に失敗しました", exc_info=task.exception())
+
+
+def is_in_game(guild_id: int) -> bool:
+    """ゲーム中か。開始の読み上げしかしていない (まだ誰も話していない) 場合はゲーム前とみなす。"""
+    session = sessions.get_or_create(guild_id)
+    return session.state.game_result is None and any(m.get("role") == "user" for m in session.history)
 
 
 def is_game_over(guild_id: int) -> bool:
