@@ -10,6 +10,8 @@ VOWELS = set("AEIOU")
 @dataclass
 class BombState:
     serial_number: str | None = None
+    # シリアル全体は聞かず「末尾は奇数」とだけ答えることもあるため、末尾の偶奇だけでも持てるようにする
+    serial_last_digit_odd: bool | None = None
     batteries: int | None = None
     lit_indicators: set[str] | None = None
     unlit_indicators: set[str] | None = None
@@ -28,6 +30,8 @@ class BombState:
             last_digit = f"末尾の数字{digits[-1]}は{'偶数' if int(digits[-1]) % 2 == 0 else '奇数'}" if digits else "数字なし"
             vowel = "母音を含む" if VOWELS & set(serial.upper()) else "母音を含まない"
             lines.append(f"- シリアルナンバー: {serial} ({last_digit}、{vowel})")
+        elif self.serial_last_digit_odd is not None:
+            lines.append(f"- シリアルナンバーの最後の数字: {'奇数' if self.serial_last_digit_odd else '偶数'}")
         if self.batteries is not None:
             lines.append(f"- バッテリー: {self.batteries}本")
         if self.lit_indicators is not None:

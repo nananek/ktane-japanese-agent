@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import time
 from dataclasses import dataclass, field
 
 from openai import OpenAI
@@ -7,9 +9,13 @@ from openai import OpenAI
 from .bomb_state import BombState
 from .tools import ToolLog, build_tools, run_tool
 
+logger = logging.getLogger(__name__)
+
 SESSION_ID_PLACEHOLDER = "{session_id}"
 # 1回の応答でツール呼び出しを繰り返せる上限 (情報記録→マニュアル取得→ソルバーなど)。超えたらツールなしで回答させる
 MAX_TOOL_ROUNDS = 4
+# 同じ応答で記録とソルバーが同時に呼ばれたとき、ソルバーが記録前の情報で判定しないよう記録を先に実行する
+RECORD_TOOL = "update_bomb_info"
 
 TOOLS = build_tools()
 CHAT_TOOLS = [{"type": "function", "function": tool} for tool in TOOLS]
@@ -71,9 +77,20 @@ class LLMClient:
             return self._reply_responses(system_prompt, history, headers, state)
         return self._reply_chat(system_prompt, history, headers, state)
 
+    @staticmethod
+    def _finish_with_solver_speech(result: LLMReply) -> bool:
+        """ソルバーが確定した発話を返していれば、LLMに文章化させる往復を省いてそのまま応答にする。"""
+        speech = result.tool_log.final_speech
+        if speech is None:
+            return False
+        result.text = speech
+        result.messages.append({"role": "assistant", "content": speech})
+        return True
+
     def _reply_chat(self, system_prompt: str, history: list[dict], headers: dict[str, str], state: BombState) -> LLMReply:
         result = LLMReply(text="")
         for round_index in range(MAX_TOOL_ROUNDS + 1):
+            started_at = time.monotonic()
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "system", "content": system_prompt}, *history, *result.messages],
@@ -83,6 +100,7 @@ class LLMClient:
                 extra_headers=headers,
                 **({"reasoning_effort": self._reasoning_effort} if self._reasoning_effort else {}),
             )
+            logger.info("timing: llm round %d %.2fs", round_index + 1, time.monotonic() - started_at)
             message = response.choices[0].message
             if not message.tool_calls:
                 result.text = message.content or ""
@@ -98,9 +116,12 @@ class LLMClient:
                     for call in message.tool_calls
                 ],
             })
-            for call in message.tool_calls:
+            result.tool_log.final_speech = None
+            for call in sorted(message.tool_calls, key=lambda c: c.function.name != RECORD_TOOL):
                 output = run_tool(call.function.name, call.function.arguments, state, result.tool_log)
                 result.messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+            if self._finish_with_solver_speech(result):
+                return result
         raise AssertionError("unreachable")
 
     def _reply_responses(
@@ -108,6 +129,7 @@ class LLMClient:
     ) -> LLMReply:
         result = LLMReply(text="")
         for round_index in range(MAX_TOOL_ROUNDS + 1):
+            started_at = time.monotonic()
             response = self._client.responses.create(
                 model=self._model,
                 instructions=system_prompt,
@@ -117,16 +139,20 @@ class LLMClient:
                 extra_headers=headers,
                 **({"reasoning": {"effort": self._reasoning_effort}} if self._reasoning_effort else {}),
             )
+            logger.info("timing: llm round %d %.2fs", round_index + 1, time.monotonic() - started_at)
             calls = [item for item in response.output if item.type == "function_call"]
             if not calls:
                 result.text = response.output_text or ""
                 result.messages.append({"role": "assistant", "content": result.text})
                 return result
 
-            for call in calls:
+            result.tool_log.final_speech = None
+            for call in sorted(calls, key=lambda c: c.name != RECORD_TOOL):
                 output = run_tool(call.name, call.arguments, state, result.tool_log)
                 result.messages.append(
                     {"type": "function_call", "call_id": call.call_id, "name": call.name, "arguments": call.arguments}
                 )
                 result.messages.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
+            if self._finish_with_solver_speech(result):
+                return result
         raise AssertionError("unreachable")

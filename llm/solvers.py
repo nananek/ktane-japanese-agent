@@ -15,6 +15,17 @@ from .manual import KNOWLEDGE_DIR
 KANJI_ORDINALS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 
 
+@dataclass(frozen=True)
+class SolverResult:
+    """ソルバーの結果。speech があれば、LLMに文章化させずそのまま読み上げてよい確定した発話。
+
+    答えが決まった後にLLMへもう1往復させると応答が1〜2秒遅れるため、定型で言える結果はここで作る。
+    """
+
+    text: str
+    speech: str | None = None
+
+
 def _read(file_name: str) -> str | None:
     path = KNOWLEDGE_DIR / file_name
     return path.read_text(encoding="utf-8") if path.exists() else None
@@ -59,10 +70,24 @@ def solve_keypad(symbol_ids: list[str]) -> str:
         if wanted <= {symbol_id for symbol_id, _, _ in column}
     ]
     if not candidates:
-        return (
-            "指定した記号をすべて含む列はありません。記号の特定を誤っている可能性が高いので、"
-            "自信のない記号の見た目を聞き返してください。"
-        )
+        # 1記号だけ食い違う列があれば、その記号の特定ミスの可能性が高いので聞き返す的を示す
+        appearances = {symbol_id: appearance for column in columns for symbol_id, _, appearance in column}
+        hints = []
+        for index, column in enumerate(columns, 1):
+            column_ids = {symbol_id for symbol_id, _, _ in column}
+            missing = [symbol_id for symbol_id in symbol_ids if symbol_id not in column_ids]
+            if len(missing) == 1 and len(symbol_ids) > 1:
+                alternatives = "、".join(
+                    f"{char}({appearance})" for symbol_id, char, appearance in column if symbol_id not in wanted
+                )
+                hints.append(
+                    f"列{index}なら「{appearances.get(missing[0], missing[0])}」({missing[0]})以外の3つが一致する。"
+                    f"その記号は実は次のどれかではないか: {alternatives}"
+                )
+        message = "指定した記号をすべて含む列はありません。記号の特定を誤っている可能性が高いです。"
+        if hints:
+            return message + "\n" + "\n".join(hints) + "\n食い違っている記号の見た目だけを聞き返してください。"
+        return message + "自信のない記号の見た目を聞き返してください。"
     if len(candidates) > 1:
         numbers = "、".join(f"列{index}" for index, _ in candidates)
         return f"候補の列が複数あります ({numbers})。残りの記号も特定してから再度呼んでください。"
@@ -135,7 +160,10 @@ def solve_memory(state: BombState, display: int, buttons: list[int], stage: int 
     state.memory_presses.append((position, label))
 
     done = "これで解除。" if stage == len(rules) else f"次はステージ{stage + 1}。"
-    return f"ステージ{stage}: 左から{position}番目、ラベル「{label}」のボタンを押す。{done}"
+    return SolverResult(
+        f"ステージ{stage}: 左から{position}番目、ラベル「{label}」のボタンを押す。{done}",
+        f"左から{position}番目、「{label}」を押して。",
+    )
 
 
 # ---------------------------------------------------------------- 順番ワイヤ
@@ -178,14 +206,18 @@ def solve_wire_sequence(state: BombState, panel: int, wires: list[dict]) -> str:
             counts[color] += 1
 
     results = []
+    counts_at = []
     for index, (color, target) in enumerate(parsed, 1):
         counts[color] += 1
         cut_targets = rules[color].get(counts[color])
         if cut_targets is None:
             return f"{WIRE_COLORS[color]}のワイヤが{counts[color]}本目で、表の範囲を超えています。入力を確認してください。"
         verdict = "切る" if target in cut_targets else "切らない"
+        counts_at.append(counts[color])
         results.append(f"{index}本目({WIRE_COLORS[color]}→{target}, {WIRE_COLORS[color]}{counts[color]}本目): {verdict}")
-    return f"パネル{panel}: " + "、".join(results)
+    cut = [str(i) for i, (color, target) in enumerate(parsed, 1) if target in rules[color].get(counts_at[i - 1], set())]
+    speech = f"{'、'.join(cut)}本目を切って、次のパネルへ。" if cut else "どれも切らずに次のパネルへ。"
+    return SolverResult(f"パネル{panel}: " + "、".join(results), speech)
 
 
 # ---------------------------------------------------------------- 迷路
@@ -281,4 +313,208 @@ def solve_maze(circles: list[dict], start: dict, goal: dict) -> str:
             grouped[-1][1] += 1
         else:
             grouped.append([direction, 1])
-    return f"{maze.name}が該当。押す順番: " + "、".join(f"{d}{n}" for d, n in grouped)
+    moves_text = "、".join(f"{d}{n}" for d, n in grouped)
+    return SolverResult(f"{maze.name}が該当。押す順番: {moves_text}", f"{moves_text}。")
+
+
+# ---------------------------------------------------------------- ワイヤ・ボタン共通 (条件付きルールの評価)
+#
+# wires.md / the-button.md は「条件 (かつ 条件) の場合、操作」の優先順位付きルールで書かれている。
+# 条件の文言を原子条件に分解し、爆弾の情報が未判明な変数は取りうる値を総当たりして、
+# 答えが変わる変数だけを「聞くべき情報」として返す (答えに影響しない質問で時間を使わないため)。
+
+RULE_LINE_RE = re.compile(r"^\d+\. (.+?)。?$", re.M)
+COLOR_NAMES = {"赤": "red", "青": "blue", "黄色": "yellow", "白": "white", "黒": "black"}
+COLOR_RE = "(赤|青|黄色|白|黒)"
+UNKNOWN_VARIABLE_LABELS = {
+    "serial_odd": "シリアルナンバーの最後の数字が奇数か",
+    "batteries": "バッテリーの本数",
+}
+# 読み上げ用の短い聞き方
+QUESTION_LABELS = {"serial_odd": "シリアルの末尾は奇数", "batteries": "電池は何本"}
+
+
+def _split_rule(sentence: str) -> tuple[list[str], str]:
+    sentence = sentence.removeprefix("そうでない場合、")
+    condition, _, action = sentence.rpartition("、")
+    atoms = [a for a in re.split(r"かつ|、", condition) if a] if condition else []
+    return atoms, action
+
+
+def _enumerate(unknowns: dict[str, list]) -> list[dict]:
+    assignments = [{}]
+    for name, values in unknowns.items():
+        assignments = [{**a, name: v} for a in assignments for v in values]
+    return assignments
+
+
+def _decide(rules, evaluate, known: dict, unknowns: dict[str, list], resolve=lambda action, env: action):
+    """全ての未判明変数の組み合わせで先頭一致ルールを評価し、(一意な結果 or None, 影響する変数名) を返す。
+
+    resolve は操作文を実際の結果に変換する (「最後の赤いワイヤ」と「二本目のワイヤ」が同じワイヤなら同じ答え)。
+    """
+    outcomes = []
+    for assignment in _enumerate(unknowns):
+        env = {**known, **assignment}
+        action = next((action for atoms, action in rules if all(evaluate(atom, env) for atom in atoms)), None)
+        outcome = None if action is None else resolve(action, env)
+        outcomes.append((assignment, outcome))
+    distinct = {outcome for _, outcome in outcomes}
+    if len(distinct) == 1:
+        return distinct.pop(), []
+    relevant = []
+    for name in unknowns:
+        for assignment, outcome in outcomes:
+            for other_assignment, other_outcome in outcomes:
+                differs_only_here = all(
+                    assignment[k] == other_assignment[k] for k in unknowns if k != name
+                ) and assignment[name] != other_assignment[name]
+                if differs_only_here and outcome != other_outcome and name not in relevant:
+                    relevant.append(name)
+    return None, relevant
+
+
+def _serial_odd(state: BombState) -> bool | None:
+    if state.serial_last_digit_odd is not None:
+        return state.serial_last_digit_odd
+    digits = [c for c in state.serial_number or "" if c.isdigit()]
+    return int(digits[-1]) % 2 == 1 if digits else None
+
+
+def _missing_message(names: list[str]) -> SolverResult:
+    items = "、".join(UNKNOWN_VARIABLE_LABELS.get(n, n) for n in names)
+    return SolverResult(
+        f"判定には次の情報が必要です: {items}。これらをまとめて1回で聞き、update_bomb_info で記録してから再度呼んでください。",
+        "、".join(QUESTION_LABELS.get(n, UNKNOWN_VARIABLE_LABELS.get(n, n)) for n in names) + "？",
+    )
+
+
+# ---------------------------------------------------------------- ワイヤ
+
+WIRE_SECTION_COUNT_RE = re.compile(r"^## (\d)本のワイヤ\n(.*?)(?=^## |\Z)", re.M | re.S)
+
+
+def load_wire_rules() -> dict[int, list[tuple[list[str], str]]]:
+    text = _read("wires.md")
+    if text is None:
+        return {}
+    return {int(n): [_split_rule(s) for s in RULE_LINE_RE.findall(body)] for n, body in WIRE_SECTION_COUNT_RE.findall(text)}
+
+
+def _wire_atom(atom: str, env: dict) -> bool:
+    colors = env["colors"]
+    if match := re.search(f"最後のワイヤが{COLOR_RE}", atom):
+        return colors[-1] == COLOR_NAMES[match.group(1)]
+    if match := re.search(f"{COLOR_RE}いワイヤがな[けく]", atom):
+        return colors.count(COLOR_NAMES[match.group(1)]) == 0
+    if match := re.search(f"{COLOR_RE}いワイヤが一本よりも多", atom):
+        return colors.count(COLOR_NAMES[match.group(1)]) > 1
+    if match := re.search(f"{COLOR_RE}いワイヤが一本しかな", atom):
+        return colors.count(COLOR_NAMES[match.group(1)]) == 1
+    if "シリアルナンバーの最後の数字が奇数" in atom:
+        return env["serial_odd"]
+    raise ValueError(f"wires.md の条件を解釈できません: {atom}")
+
+
+def _wire_action(action: str, colors: list[str]) -> str:
+    match = re.fullmatch(f"(最初|最後|[一二三四五六]本目)の(?:{COLOR_RE}い)?ワイヤを切る", action)
+    if match is None:
+        raise ValueError(f"wires.md の操作を解釈できません: {action}")
+    position, color_name = match.groups()
+    if color_name:
+        color = COLOR_NAMES[color_name]
+        index = max(i for i, c in enumerate(colors) if c == color) + 1
+    elif position == "最初":
+        index = 1
+    elif position == "最後":
+        index = len(colors)
+    else:
+        index = KANJI_ORDINALS[position[0]]
+    color_label = {v: k for k, v in COLOR_NAMES.items()}[colors[index - 1]]
+    return f"上から{index}本目({color_label})のワイヤを切る。"
+
+
+def solve_wires(state: BombState, colors: list[str]) -> str:
+    rules = load_wire_rules()
+    if len(colors) not in rules or any(c not in COLOR_NAMES.values() for c in colors):
+        return "ワイヤは3〜6本、色は red/blue/yellow/white/black を上から順に指定してください。"
+    serial_odd = _serial_odd(state)
+    unknowns = {} if serial_odd is not None else {"serial_odd": [False, True]}
+    answer, missing = _decide(
+        rules[len(colors)], _wire_atom, {"colors": colors, "serial_odd": serial_odd}, unknowns,
+        resolve=lambda action, env: _wire_action(action, env["colors"]),
+    )
+    if answer is None:
+        return _missing_message(missing)
+    return SolverResult(answer, answer.removesuffix("のワイヤを切る。").replace("(", "、").replace(")", "の") + "ワイヤを切って。")
+
+
+# ---------------------------------------------------------------- ボタン
+
+BUTTON_RELEASE_RE = re.compile(r"^- \*\*(.+?)場合：\*\* カウントダウンタイマーに(\d)が表示されているときに離す", re.M)
+
+
+def load_button_rules() -> tuple[list[tuple[list[str], str]], dict[str, int]]:
+    text = _read("the-button.md")
+    if text is None:
+        return [], {}
+    rules_part, _, release_part = text.partition("## ボタンを離すタイミング")
+    rules = [_split_rule(s) for s in RULE_LINE_RE.findall(rules_part)]
+    release = {}
+    for color_text, digit in BUTTON_RELEASE_RE.findall(release_part):
+        key = next((COLOR_NAMES[name] for name in COLOR_NAMES if color_text.startswith(name)), "other")
+        release[key] = int(digit)
+    return rules, release
+
+
+def _button_atom(atom: str, env: dict) -> bool:
+    if "上記のいずれもが該当しない" in atom:
+        return True
+    if match := re.search(f"ボタンが{COLOR_RE}", atom):
+        return env["color"] == COLOR_NAMES[match.group(1)]
+    if match := re.search(r"ボタンに?「(.+?)」と書", atom) or re.search(r"「(.+?)」と書かれている", atom):
+        return env["label"] == match.group(1)
+    if match := re.search(r"バッテリーが(\d)本よりも多", atom):
+        return env["batteries"] > int(match.group(1))
+    if match := re.search(r"「([A-Z]+)」という点灯したインジケーターがある", atom):
+        return env[f"lit_{match.group(1)}"]
+    raise ValueError(f"the-button.md の条件を解釈できません: {atom}")
+
+
+def solve_button(state: BombState, color: str, label: str, strip_color: str | None = None) -> str:
+    rules, release = load_button_rules()
+    if color not in COLOR_NAMES.values():
+        return "ボタンの色は red/blue/yellow/white/black で指定してください。"
+
+    known = {"color": color, "label": label}
+    unknowns: dict[str, list] = {}
+    if state.batteries is None:
+        thresholds = [int(n) for atoms, _ in rules for a in atoms for n in re.findall(r"バッテリーが(\d)本よりも多", a)]
+        unknowns["batteries"] = list(range(max(thresholds, default=0) + 2))
+    else:
+        known["batteries"] = state.batteries
+    for atoms, _ in rules:
+        for atom in atoms:
+            for indicator in re.findall(r"「([A-Z]+)」という点灯したインジケーター", atom):
+                key = f"lit_{indicator}"
+                if state.lit_indicators is None:
+                    unknowns[key] = [False, True]
+                    UNKNOWN_VARIABLE_LABELS.setdefault(key, f"点灯した{indicator}インジケーターがあるか")
+                    QUESTION_LABELS.setdefault(key, f"点灯した{indicator}はある")
+                else:
+                    known[key] = indicator in state.lit_indicators
+
+    action, missing = _decide(
+        rules, _button_atom, known, unknowns, resolve=lambda action, env: "tap" if "すぐに離す" in action else "hold"
+    )
+    if action is None:
+        return _missing_message(missing)
+    if action == "tap":
+        return SolverResult("ボタンを押してすぐに離す。", "押してすぐ離して。")
+    if strip_color is None:
+        return SolverResult(
+            "ボタンを押したままにして、右側に光る帯の色を聞く。帯の色を strip_color に指定して再度呼ぶ。",
+            "押したまま、帯の色は？",
+        )
+    digit = release.get(strip_color, release.get("other"))
+    return SolverResult(f"帯が{strip_color}なので、タイマーのどこかの桁に{digit}が表示されたときに離す。", f"タイマーに{digit}が出たら離して。")

@@ -3,6 +3,7 @@ import copy
 import io
 import logging
 import os
+import re
 import time
 
 import discord
@@ -16,12 +17,13 @@ from session import SessionManager
 from stt.whisper_client import WhisperClient
 from tts.voicevox_client import VoicevoxClient
 from voice import dave
+from voice.chime import make_turn_chime
 from voice.receiver import TranscribingSink
 
 load_dotenv()
 dave.install()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("ktane-bot")
 
 intents = discord.Intents.default()
@@ -34,25 +36,28 @@ sessions = SessionManager()
 # 応答の生成〜読み上げはギルドごとに1つずつ (開始時の読み上げとも重ならないように)
 utterance_locks: dict[int, asyncio.Lock] = {}
 whisper_lock = asyncio.Lock()
-# 文字起こし済みで、まだ応答していない発話
+# 文字起こし済みで、まだ応答していない発話と、そのうち最初の発話が終わった時刻 (応答までの遅延計測用)
 pending_texts: dict[int, list[str]] = {}
+pending_since: dict[int, float] = {}
 responder_tasks: dict[int, asyncio.Task] = {}
 # 応答生成中に新しい発話が届いたときに作り直す上限回数 (話し続けられても応答が返らなくならないように)
 MAX_REGENERATIONS = 2
+FILLER_WORDS = {"", "ん", "んー", "んん", "あ", "あー", "あっ", "え", "えー", "えっと", "えーと", "あの", "あのー", "うーん", "ふむ"}
 LLM_FAILURE_REPLY = "すみません、応答が取れませんでした。もう一度言ってください。"
-# 読み上げ終了後も聞き取りを止めておく秒数 (スピーカーからの残響をbot自身の声として拾わないように)
-ECHO_TAIL_SECONDS = 0.5
+# 読み上げ終了後も聞き取りを止めておく秒数 (スピーカーからの残響をbot自身の声として拾わないように)。
+# 最後に鳴るのは短く減衰の速いチャイムなので短めでよく、長いとチャイム直後の話し始めが削られる
+ECHO_TAIL_SECONDS = 0.3
+TURN_CHIME = make_turn_chime()
 playback_ended_at: dict[int, float] = {}
 whisper = WhisperClient()
 llm = LLMClient()
 voicevox = VoicevoxClient()
 manual_version, manual_code = find_manual_version()
-# 開始時にマニュアルの版を伝え、Defuserがゲーム側の認証コードと一致しているか確認できるようにする
+# 開始時にマニュアルの版を伝え、Defuserがゲーム側の認証コードと一致しているか確認できるようにする。
+# 爆弾の情報はここでは聞かない (最初に全部確認すると時間を使い切るため、判定に要るときだけ聞く)
 opening_line = (
-    f"マニュアル、バージョン{manual_version or '不明'}、認証コード{manual_code}。"
-    if manual_code
-    else None
-)
+    f"マニュアル、バージョン{manual_version or '不明'}、認証コード{manual_code}。" if manual_code else ""
+) + "どのモジュールから？"
 
 
 @bot.event
@@ -109,17 +114,14 @@ async def newbomb(ctx: commands.Context) -> None:
 
 
 async def announce_opening(ctx: commands.Context) -> None:
-    """マニュアルの版と認証コードを読み上げ、会話履歴にもExpertの発言として残す。"""
-    if opening_line is None:
-        return
+    """マニュアルの版と認証コードを伝えて爆弾の情報を聞き、会話履歴にもExpertの発言として残す。"""
     lock = utterance_locks.setdefault(ctx.guild.id, asyncio.Lock())
     async with lock:
         sessions.get_or_create(ctx.guild.id).add_assistant_message(opening_line)
         await ctx.send(f"🤖 {opening_line}")
         if ctx.voice_client is not None:
             await wait_voice_encryption_ready(ctx.voice_client)
-            wav_bytes = await asyncio.to_thread(voicevox.synthesize, opening_line)
-            await play_wav(ctx.voice_client, wav_bytes)
+            await speak(ctx.voice_client, opening_line)
 
 
 async def wait_voice_encryption_ready(vc: discord.VoiceClient, timeout: float = 5.0) -> None:
@@ -138,6 +140,12 @@ def _log_utterance_error(future) -> None:
         logger.error("発話の処理に失敗しました", exc_info=future.exception())
 
 
+def is_filler(text: str) -> bool:
+    """意味を持たない言いよどみだけの発話か。「はい」「うん」は質問への答えになりうるので含めない。"""
+    normalized = re.sub(r"[\s。、,.!?！？〜…]", "", text)
+    return normalized in FILLER_WORDS
+
+
 async def handle_utterance(ctx: commands.Context, user_id: int, pcm_16k) -> None:
     """発話を文字起こしして未処理の発話に積み、応答生成はギルドごとの応答係にまとめて任せる。
 
@@ -145,10 +153,22 @@ async def handle_utterance(ctx: commands.Context, user_id: int, pcm_16k) -> None
     そこで待っている間に溜まった発話は1つの発言にまとめて応答する。
     """
     # 文字起こしは発話順に1件ずつ (GPUを取り合わず、順番も入れ替わらないように)
+    utterance_ended_at = time.monotonic()
     async with whisper_lock:
+        stt_started_at = time.monotonic()
         text = await asyncio.to_thread(whisper.transcribe, pcm_16k)
+        logger.info(
+            "timing: stt %.2fs (audio %.1fs, waited %.2fs)",
+            time.monotonic() - stt_started_at, len(pcm_16k) / 16000, stt_started_at - utterance_ended_at,
+        )
         if not text:
             return
+        if is_filler(text):
+            # 「ん」「えーと」だけの発話に応答すると、直前の指示を繰り返すなど往復が無駄に増える
+            logger.info("filler ignored: %s", text)
+            return
+        if not pending_texts.get(ctx.guild.id):
+            pending_since[ctx.guild.id] = utterance_ended_at
         pending_texts.setdefault(ctx.guild.id, []).append(text)
     logger.info("transcript: %s", text)
     await ctx.send(f"🎙️ {text}")
@@ -174,6 +194,7 @@ async def respond_to_pending(ctx: commands.Context) -> None:
                 # ツールが書き換える状態はコピーに対して試し、応答を採用したときだけ反映する
                 # (作り直しで捨てた応答のソルバー記録が残ると、記憶や順番ワイヤの数え方が狂うため)
                 attempt_state = copy.deepcopy(session.state)
+                llm_started_at = time.monotonic()
                 try:
                     result = await asyncio.to_thread(
                         llm.reply,
@@ -186,6 +207,7 @@ async def respond_to_pending(ctx: commands.Context) -> None:
                     # タイムアウト等。無言で止まるとDefuserが待ち続けてしまうので、言い直しを促す
                     logger.exception("LLMの応答取得に失敗しました")
                     result = None
+                logger.info("timing: llm %.2fs", time.monotonic() - llm_started_at)
                 # 応答を待つ間に続きを話していたら、その応答は古いので捨てて全部まとめて作り直す
                 if pending and attempt < MAX_REGENERATIONS:
                     logger.info("応答生成中に新しい発話が届いたため、まとめて再生成します")
@@ -209,22 +231,36 @@ async def respond_to_pending(ctx: commands.Context) -> None:
             await ctx.send(f"🤖 {reply}")
 
             if ctx.voice_client is not None and reply:
-                wav_bytes = await asyncio.to_thread(voicevox.synthesize, reply)
-                await play_wav(ctx.voice_client, wav_bytes)
+                await speak(ctx.voice_client, reply, since=pending_since.pop(ctx.guild.id, None))
 
 
-async def play_wav(vc: discord.VoiceClient, wav_bytes: bytes) -> None:
-    """読み上げを再生し、再生が終わるまで待つ。"""
+async def speak(vc: discord.VoiceClient, text: str, since: float | None = None) -> None:
+    """読み上げに続けてターン交代のチャイムを鳴らし、鳴り終わるまで待つ。
+
+    チャイムが鳴り終わると聞き取りが再開するので、Defuserはチャイムを話し始めの合図にできる。
+    """
+    tts_started_at = time.monotonic()
+    wav_bytes = await asyncio.to_thread(voicevox.synthesize, text)
+    now = time.monotonic()
+    if since is None:
+        logger.info("timing: tts %.2fs", now - tts_started_at)
+    else:
+        logger.info("timing: tts %.2fs, 発話終了から読み上げ開始まで %.2fs", now - tts_started_at, now - since)
+    await play_source(vc, discord.FFmpegPCMAudio(io.BytesIO(wav_bytes), pipe=True))
+    await play_source(vc, discord.PCMAudio(io.BytesIO(TURN_CHIME)))
+
+
+async def play_source(vc: discord.VoiceClient, source: discord.AudioSource) -> None:
+    """音声を再生し、再生が終わるまで待つ。"""
     loop = asyncio.get_running_loop()
     finished = asyncio.Event()
 
     def after(error: Exception | None) -> None:
         playback_ended_at[vc.guild.id] = time.monotonic()
         if error is not None:
-            logger.error("読み上げの再生に失敗しました", exc_info=error)
+            logger.error("音声の再生に失敗しました", exc_info=error)
         loop.call_soon_threadsafe(finished.set)
 
-    source = discord.FFmpegPCMAudio(io.BytesIO(wav_bytes), pipe=True)
     vc.play(source, after=after)
     await finished.wait()
 

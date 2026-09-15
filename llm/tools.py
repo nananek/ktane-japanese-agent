@@ -1,11 +1,23 @@
 """LLMに渡すツールの定義と実行。"""
 
 import json
+import logging
 from dataclasses import dataclass, field
 
 from .bomb_state import INDICATORS, PORTS, BombState
 from .manual import MODULE_IDS, load_module_manual
-from .solvers import keypad_symbol_ids, solve_keypad, solve_maze, solve_memory, solve_wire_sequence
+from .solvers import (
+    SolverResult,
+    keypad_symbol_ids,
+    solve_button,
+    solve_keypad,
+    solve_maze,
+    solve_memory,
+    solve_wire_sequence,
+    solve_wires,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -14,6 +26,8 @@ class ToolLog:
 
     consulted_modules: list[str] = field(default_factory=list)
     solver_outputs: list[str] = field(default_factory=list)
+    # 直近のソルバーが返した、LLMを通さずそのまま読み上げてよい発話
+    final_speech: str | None = None
 
 
 MAZE_POSITION = {
@@ -47,6 +61,8 @@ def build_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "serial_number": {"type": ["string", "null"], "description": "シリアルナンバー (英数字)。未言及なら null"},
+                    "serial_last_digit_odd": {"type": ["boolean", "null"],
+                                              "description": "シリアル全体ではなく末尾の数字の偶奇だけ判明したとき、奇数なら true・偶数なら false。それ以外は null"},
                     "batteries": {"type": ["integer", "null"], "minimum": 0, "description": "バッテリーの合計本数。未言及なら null"},
                     "lit_indicators": {"type": ["array", "null"], "items": {"type": "string", "enum": list(INDICATORS)},
                                        "description": "点灯しているインジケーターすべて。「インジケーターはない」などと言われたら空配列 []、触れていなければ null"},
@@ -56,7 +72,42 @@ def build_tools() -> list[dict]:
                               "description": "ついているポートすべて。「ポートはない」などと言われたら空配列 []、ポートに触れていなければ null"},
                     "strikes": {"type": ["integer", "null"], "minimum": 0, "description": "現在のミス回数。未言及なら null"},
                 },
-                "required": ["serial_number", "batteries", "lit_indicators", "unlit_indicators", "ports", "strikes"],
+                "required": ["serial_number", "serial_last_digit_odd", "batteries", "lit_indicators",
+                             "unlit_indicators", "ports", "strikes"],
+            },
+        },
+        {
+            "name": "solve_wires",
+            "description": (
+                "ワイヤモジュール (3〜6本の単色ワイヤ) で切るワイヤを求める。自分で判定せず必ずこのツールを使うこと。"
+                "Defuserから全ワイヤの色を聞いてから呼ぶこと (推測した色で呼ばない)。"
+                "判定に足りない爆弾の情報があれば、答えに影響するものだけを返す。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "colors": {"type": "array", "items": {"type": "string", "enum": ["red", "blue", "yellow", "white", "black"]},
+                               "minItems": 3, "maxItems": 6, "description": "ワイヤの色を上から順に"},
+                },
+                "required": ["colors"],
+            },
+        },
+        {
+            "name": "solve_button",
+            "description": (
+                "ボタンモジュールで押してすぐ離すか押し続けるかを求め、押し続ける場合は帯の色から離すタイミングを求める。"
+                "自分で判定せず必ずこのツールを使うこと。判定に足りない爆弾の情報があれば、答えに影響するものだけを返す。"
+                "Defuserからボタンの色と文字を聞いてから呼ぶこと。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "color": {"type": "string", "enum": ["red", "blue", "yellow", "white", "black"], "description": "ボタンの色"},
+                    "label": {"type": "string", "description": "ボタンに書かれた文字 (例: 中止、起爆、長押し、押す)"},
+                    "strip_color": {"type": ["string", "null"], "enum": ["red", "blue", "yellow", "white", "black", None],
+                                    "description": "押し続けたときに右側に光る帯の色。まだ分からなければ null"},
+                },
+                "required": ["color", "label", "strip_color"],
             },
         },
         {
@@ -133,6 +184,8 @@ def build_tools() -> list[dict]:
 
 
 def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
+    # LLMが発話をどう構造化したかは誤判定の原因調査に要るので、引数を必ず残す
+    logger.info("tool call: %s %s", name, arguments)
     try:
         args = json.loads(arguments or "{}")
         if name == "get_module_manual":
@@ -143,6 +196,10 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
         elif name == "solve_memory":
             stage = None if args.get("stage") is None else int(args["stage"])
             output = solve_memory(state, int(args["display"]), [int(b) for b in args["buttons"]], stage)
+        elif name == "solve_wires":
+            output = solve_wires(state, list(args["colors"]))
+        elif name == "solve_button":
+            output = solve_button(state, args["color"], str(args["label"]), args.get("strip_color"))
         elif name == "solve_wire_sequence":
             output = solve_wire_sequence(state, int(args["panel"]), list(args["wires"]))
         elif name == "solve_maze":
@@ -153,6 +210,11 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
             return f"不明なツールです: {name}"
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
         return f"引数が不正です ({e}): {arguments}"
+    if isinstance(output, SolverResult):
+        log.final_speech = output.speech
+        output = output.text
+    else:
+        log.final_speech = None
     log.solver_outputs.append(output)
     return output
 
@@ -161,6 +223,8 @@ def _update_bomb_info(state: BombState, args: dict) -> str:
     # null (未言及) の項目は既存の記録を残す
     if args.get("serial_number"):
         state.serial_number = str(args["serial_number"]).upper().replace(" ", "")
+    if args.get("serial_last_digit_odd") is not None:
+        state.serial_last_digit_odd = bool(args["serial_last_digit_odd"])
     if args.get("batteries") is not None:
         state.batteries = int(args["batteries"])
     for key in ("lit_indicators", "unlit_indicators", "ports"):
