@@ -1,9 +1,7 @@
 import asyncio
-import copy
 import io
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass
 
@@ -12,9 +10,9 @@ from discord import app_commands
 from discord.ext import voice_recv
 from dotenv import load_dotenv
 
+from conversation import LLM_FAILURE_REPLY, attempt_reply, build_opening_line, commit_reply, is_filler, is_repeat_request
 from llm.llm_client import LLMClient
-from llm.manual import find_manual_version, module_name
-from llm.prompts import build_system_prompt
+from llm.manual import module_name
 from session import SessionManager
 from stt.whisper_client import WhisperClient
 from tts.voicevox_client import VoicevoxClient
@@ -48,15 +46,8 @@ responder_tasks: dict[int, asyncio.Task] = {}
 text_post_tasks: dict[int, asyncio.Task] = {}
 # 応答生成中に新しい発話が届いたときに作り直す上限回数 (話し続けられても応答が返らなくならないように)
 MAX_REGENERATIONS = 2
-# 聞き返し。LLMに回すと「最初からやり直す」と解釈されることがあるため、直前の読み上げをそのまま繰り返す
-REPEAT_REQUEST_RE = re.compile(
-    r"(もう(一|1|いっ)(度|回|かい)|繰り返して|リピート|聞こえなかった|なんて(言った)?|何て(言った)?)"
-    r"(お願い(します)?|言って(ください)?|ください)?"
-)
 # 直前にbotが読み上げた内容 (聞き返し用)
 last_replies: dict[int, str] = {}
-FILLER_WORDS = {"", "ん", "んー", "んん", "あ", "あー", "あっ", "え", "えー", "えっと", "えーと", "あの", "あのー", "うーん", "ふむ"}
-LLM_FAILURE_REPLY = "すみません、応答が取れませんでした。もう一度言ってください。"
 # 読み上げ終了後も聞き取りを止めておく秒数 (スピーカーからの残響をbot自身の声として拾わないように)。
 # 最後に鳴るのは短く減衰の速いチャイムなので短めでよく、長いとチャイム直後の話し始めが削られる
 ECHO_TAIL_SECONDS = 0.3
@@ -68,12 +59,7 @@ playback_ended_at: dict[int, float] = {}
 whisper = WhisperClient()
 llm = LLMClient()
 voicevox = VoicevoxClient()
-manual_version, manual_code = find_manual_version()
-# 開始時にマニュアルの版を伝え、Defuserがゲーム側の認証コードと一致しているか確認できるようにする。
-# 爆弾の情報はここでは聞かない (最初に全部確認すると時間を使い切るため、判定に要るときだけ聞く)
-opening_line = (
-    f"マニュアル、バージョン{manual_version or '不明'}、認証コード{manual_code}。" if manual_code else ""
-) + "どのモジュールから？"
+opening_line = build_opening_line()
 
 
 @bot.event
@@ -259,17 +245,11 @@ def _log_post_error(task: asyncio.Task) -> None:
 
 
 def is_in_game(guild_id: int) -> bool:
-    """ゲーム中か。開始の読み上げしかしていない (まだ誰も話していない) 場合はゲーム前とみなす。"""
-    session = sessions.get_or_create(guild_id)
-    return session.state.game_result is None and any(m.get("role") == "user" for m in session.history)
+    return sessions.get_or_create(guild_id).is_in_game
 
 
 def is_game_over(guild_id: int) -> bool:
-    return sessions.get_or_create(guild_id).state.game_result is not None
-
-
-def is_repeat_request(text: str) -> bool:
-    return REPEAT_REQUEST_RE.fullmatch(re.sub(r"[\s。、,.!?！？〜…ー]", "", text)) is not None
+    return sessions.get_or_create(guild_id).is_game_over
 
 
 async def repeat_last_reply(conv: Conversation) -> None:
@@ -280,12 +260,6 @@ async def repeat_last_reply(conv: Conversation) -> None:
         post_in_background(conv, f"🤖 {reply}")
         if conv.voice_client is not None:
             await speak(conv.voice_client, reply)
-
-
-def is_filler(text: str) -> bool:
-    """意味を持たない言いよどみだけの発話か。「はい」「うん」は質問への答えになりうるので含めない。"""
-    normalized = re.sub(r"[\s。、,.!?！？〜…]", "", text)
-    return normalized in FILLER_WORDS
 
 
 async def handle_utterance(conv: Conversation, user_id: int, pcm_16k) -> None:
@@ -338,40 +312,21 @@ async def respond_to_pending(conv: Conversation) -> None:
         while pending:
             session = sessions.get_or_create(conv.guild.id)
             texts: list[str] = []
-            for attempt in range(MAX_REGENERATIONS + 1):
+            for regeneration in range(MAX_REGENERATIONS + 1):
                 texts.extend(pending)
                 pending.clear()
-                user_message = {"role": "user", "content": "\n".join(texts)}
-                # ツールが書き換える状態はコピーに対して試し、応答を採用したときだけ反映する
-                # (作り直しで捨てた応答のソルバー記録が残ると、記憶や順番ワイヤの数え方が狂うため)
-                attempt_state = copy.deepcopy(session.state)
                 llm_started_at = time.monotonic()
-                try:
-                    result = await asyncio.to_thread(
-                        llm.reply,
-                        build_system_prompt(attempt_state),
-                        [*session.history, user_message],
-                        session.session_id,
-                        attempt_state,
-                    )
-                except Exception:
-                    # タイムアウト等。無言で止まるとDefuserが待ち続けてしまうので、言い直しを促す
-                    logger.exception("LLMの応答取得に失敗しました")
-                    result = None
+                attempt = await asyncio.to_thread(attempt_reply, llm, session, "\n".join(texts))
                 logger.info("timing: llm %.2fs", time.monotonic() - llm_started_at)
                 # 応答を待つ間に続きを話していたら、その応答は古いので捨てて全部まとめて作り直す
-                if pending and attempt < MAX_REGENERATIONS:
+                if pending and regeneration < MAX_REGENERATIONS:
                     logger.info("応答生成中に新しい発話が届いたため、まとめて再生成します")
                     continue
                 break
 
-            session.history.append(user_message)
-            if result is None:
-                reply = LLM_FAILURE_REPLY
-            else:
-                session.history.extend(result.messages)
-                session.state = attempt_state
-                reply = result.text
+            reply = commit_reply(session, attempt)
+            result = attempt.result
+            if result is not None:
                 if session.state.game_result is not None:
                     # 終了の読み上げより後に届いた発話には応答しない
                     pending.clear()

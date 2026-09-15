@@ -19,6 +19,15 @@ class BombSession:
     def add_assistant_message(self, text: str) -> None:
         self.history.append({"role": "assistant", "content": text})
 
+    @property
+    def is_in_game(self) -> bool:
+        """ゲーム中か。開始の読み上げしかしていない (まだ誰も話していない) 場合はゲーム前とみなす。"""
+        return self.state.game_result is None and any(m.get("role") == "user" for m in self.history)
+
+    @property
+    def is_game_over(self) -> bool:
+        return self.state.game_result is not None
+
 
 class SessionManager:
     def __init__(self) -> None:

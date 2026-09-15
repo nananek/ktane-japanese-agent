@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KTANE Expert テキストチャット</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --border: #dedcd6;
+    --user: #1f5f8b; --user-text: #ffffff; --bot: #ffffff; --accent: #c2410c; --code: #f1efe9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a; --panel: #212125; --text: #ececef; --muted: #9a9aa2; --border: #34343a;
+      --user: #2f6f9f; --user-text: #ffffff; --bot: #2a2a2f; --accent: #fb923c; --code: #1b1b1e;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .status { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  button {
+    font: inherit; border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    border-radius: 8px; padding: 6px 14px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 300px; min-height: 0; }
+  #log { overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  aside { border-left: 1px solid var(--border); background: var(--panel); padding: 14px 16px; overflow-y: auto; }
+  aside h2 { font-size: 13px; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+  aside pre { white-space: pre-wrap; margin: 0; font: 13px/1.6 inherit; font-family: inherit; }
+  .msg { max-width: min(680px, 85%); padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); color: var(--user-text); border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: var(--bot); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg .meta { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .note { align-self: center; font-size: 12px; color: var(--muted); }
+  details.tool {
+    align-self: flex-start; max-width: min(680px, 85%); font-size: 13px;
+    border: 1px dashed var(--border); border-radius: 8px; padding: 4px 10px;
+  }
+  details.tool summary { cursor: pointer; color: var(--muted); }
+  details.tool summary .first { color: var(--text); margin-left: 6px; }
+  details.tool pre {
+    background: var(--code); border-radius: 6px; padding: 6px 8px; margin: 6px 0;
+    white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow-y: auto;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  details.tool .caption { font-size: 11px; color: var(--muted); }
+  .thinking { align-self: flex-start; color: var(--muted); font-size: 13px; }
+  form {
+    display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--panel);
+  }
+  textarea {
+    flex: 1; font: inherit; color: var(--text); background: var(--bg); resize: none;
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; height: 64px;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .hint { font-size: 11px; color: var(--muted); padding: 0 16px 8px; background: var(--panel); }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; }
+    aside { border-left: 0; border-top: 1px solid var(--border); max-height: 30vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>KTANE Expert テキストチャット</h1>
+  <span class="status" id="status"></span>
+  <span class="spacer"></span>
+  <button type="button" id="newbomb">新しい爆弾</button>
+</header>
+<main>
+  <div id="log" aria-live="polite"></div>
+  <aside>
+    <h2>爆弾の状態</h2>
+    <pre id="state"></pre>
+  </aside>
+</main>
+<form id="composer">
+  <textarea id="text" placeholder="Defuserとして話す内容を入力 (例: ワイヤが4本、上から赤、青、青、黒)" autofocus></textarea>
+  <button type="submit" class="primary" id="send">送信</button>
+</form>
+<div class="hint">Enterで送信 / Shift+Enterで改行。このタブだけの会話で、Discordの通話中のセッションとは別です。</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STORAGE_KEY = "ktane-chat-session";
+let chatId = null;
+let busy = false;
+let snapshot = null;
+
+function storage(action, value) {
+  try {
+    if (action === "get") return sessionStorage.getItem(STORAGE_KEY);
+    sessionStorage.setItem(STORAGE_KEY, value);
+  } catch (_) { /* 保存できなくても、リロード時に新しいセッションになるだけ */ }
+  return null;
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const error = new Error(await res.text());
+    error.status = res.status;
+    throw error;
+  }
+  return res.json();
+}
+
+function render(data, pendingText) {
+  snapshot = data;
+  chatId = data.id;
+  storage("set", chatId);
+  const log = $("log");
+  log.replaceChildren();
+  for (const entry of data.entries) log.append(renderEntry(entry));
+  if (pendingText !== undefined) {
+    log.append(renderEntry({ kind: "user", text: pendingText }));
+    const thinking = document.createElement("div");
+    thinking.className = "thinking";
+    thinking.id = "thinking";
+    log.append(thinking);
+  }
+  log.scrollTop = log.scrollHeight;
+  $("state").textContent = data.state;
+  $("status").textContent = data.game_over ? "ゲーム終了" : data.in_game ? "ゲーム中" : "ゲーム前";
+  updateControls();
+}
+
+function renderEntry(entry) {
+  if (entry.kind === "tool") {
+    const details = document.createElement("details");
+    details.className = "tool";
+    const summary = document.createElement("summary");
+    summary.textContent = entry.label;
+    // マニュアル本文は長いので、ソルバーの結果だけ1行目を見出しに出す
+    if (!entry.label.startsWith("📖") && entry.output) {
+      const first = document.createElement("span");
+      first.className = "first";
+      first.textContent = entry.output.split("\n")[0];
+      summary.append(first);
+    }
+    details.append(summary, caption("引数"), pre(entry.arguments), caption("結果"), pre(entry.output));
+    return details;
+  }
+  const el = document.createElement("div");
+  if (entry.kind === "note") {
+    el.className = "note";
+    el.textContent = entry.text;
+    return el;
+  }
+  el.className = `msg ${entry.kind}`;
+  el.textContent = entry.text;
+  if (entry.source) {
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = entry.source;
+    el.append(meta);
+  }
+  return el;
+}
+
+function caption(text) {
+  const el = document.createElement("div");
+  el.className = "caption";
+  el.textContent = text;
+  return el;
+}
+
+function pre(text) {
+  const el = document.createElement("pre");
+  el.textContent = text;
+  return el;
+}
+
+function updateControls() {
+  const gameOver = snapshot?.game_over;
+  $("send").disabled = busy || gameOver;
+  $("text").disabled = busy || gameOver;
+  $("newbomb").disabled = busy;
+  $("text").placeholder = gameOver
+    ? "ゲーム終了が記録されました。「新しい爆弾」で次を始めてください"
+    : "Defuserとして話す内容を入力 (例: ワイヤが4本、上から赤、青、青、黒)";
+}
+
+async function withBusy(task) {
+  busy = true;
+  updateControls();
+  try {
+    return await task();
+  } finally {
+    busy = false;
+    updateControls();
+  }
+}
+
+async function createSession() {
+  render(await api("POST", "/api/sessions"));
+}
+
+async function send(text) {
+  render(snapshot, text);
+  const started = performance.now();
+  const timer = setInterval(() => {
+    const el = $("thinking");
+    if (el) el.textContent = `考え中… ${((performance.now() - started) / 1000).toFixed(1)}秒`;
+  }, 100);
+  try {
+    render(await api("POST", `/api/sessions/${chatId}/messages`, { text }));
+    return true;
+  } catch (error) {
+    render(snapshot);
+    if (error.status === 404) {
+      alert("サーバーが再起動されたため、セッションが消えました。新しいセッションを始めます。");
+      await createSession();
+    } else {
+      alert(error.message);
+    }
+    return false;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+$("composer").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const text = $("text").value.trim();
+  if (!text || busy) return;
+  $("text").value = "";
+  const ok = await withBusy(() => send(text));
+  if (!ok) $("text").value = text;
+  $("text").focus();
+});
+
+$("text").addEventListener("keydown", (event) => {
+  // 日本語入力の変換確定のEnterでは送らない
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault();
+    $("composer").requestSubmit();
+  }
+});
+
+$("newbomb").addEventListener("click", () => withBusy(async () => {
+  try {
+    render(await api("POST", `/api/sessions/${chatId}/newbomb`, { force: false }));
+  } catch (error) {
+    if (error.status === 404) return createSession();
+    if (error.status !== 409) return alert(error.message);
+    if (!confirm("まだゲーム中です。会話と爆弾の状態を捨ててリセットしますか？")) return;
+    render(await api("POST", `/api/sessions/${chatId}/newbomb`, { force: true }));
+  }
+  $("text").focus();
+}));
+
+(async () => {
+  const saved = storage("get");
+  if (saved) {
+    try {
+      return render(await api("GET", `/api/sessions/${saved}`));
+    } catch (_) { /* サーバー再起動などで消えていれば作り直す */ }
+  }
+  await createSession();
+})();
+</script>
+</body>
+</html>
