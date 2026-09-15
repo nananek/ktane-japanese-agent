@@ -17,7 +17,7 @@ from session import SessionManager
 from stt.whisper_client import WhisperClient
 from tts.voicevox_client import VoicevoxClient
 from voice import dave
-from voice.chime import make_turn_chime
+from voice.chime import make_ack_blip, make_turn_chime
 from voice.receiver import TranscribingSink
 
 load_dotenv()
@@ -40,6 +40,7 @@ whisper_lock = asyncio.Lock()
 pending_texts: dict[int, list[str]] = {}
 pending_since: dict[int, float] = {}
 responder_tasks: dict[int, asyncio.Task] = {}
+text_post_tasks: dict[int, asyncio.Task] = {}
 # 応答生成中に新しい発話が届いたときに作り直す上限回数 (話し続けられても応答が返らなくならないように)
 MAX_REGENERATIONS = 2
 FILLER_WORDS = {"", "ん", "んー", "んん", "あ", "あー", "あっ", "え", "えー", "えっと", "えーと", "あの", "あのー", "うーん", "ふむ"}
@@ -48,6 +49,9 @@ LLM_FAILURE_REPLY = "すみません、応答が取れませんでした。も�
 # 最後に鳴るのは短く減衰の速いチャイムなので短めでよく、長いとチャイム直後の話し始めが削られる
 ECHO_TAIL_SECONDS = 0.3
 TURN_CHIME = make_turn_chime()
+ACK_BLIP = make_ack_blip()
+# 受け付け音の再生中か (受け付け音は短く、鳴らしている間も聞き取りを止めない)
+ack_playing: dict[int, bool] = {}
 playback_ended_at: dict[int, float] = {}
 whisper = WhisperClient()
 llm = LLMClient()
@@ -83,6 +87,8 @@ async def join(ctx: commands.Context) -> None:
             vc.stop_listening()
 
     def on_utterance(user_id: int, pcm_16k) -> None:
+        # 文字起こしより先に鳴らし、話し終わりを検出したことをすぐ伝える
+        asyncio.run_coroutine_threadsafe(play_ack(vc), bot.loop).add_done_callback(_log_utterance_error)
         future = asyncio.run_coroutine_threadsafe(handle_utterance(ctx, user_id, pcm_16k), bot.loop)
         future.add_done_callback(_log_utterance_error)
 
@@ -90,8 +96,10 @@ async def join(ctx: commands.Context) -> None:
 
     def is_muted() -> bool:
         # 読み上げ中と、読み上げ終了直後の残響が消えるまでは聞かない (半二重)
+        # 受け付け音は短く小さいので、鳴らしている間も聞き続ける (続けて話した分を削らないため)
         ended_at = playback_ended_at.get(guild_id, 0.0)
-        return vc.is_playing() or time.monotonic() - ended_at < ECHO_TAIL_SECONDS
+        speaking = vc.is_playing() and not ack_playing.get(guild_id, False)
+        return speaking or time.monotonic() - ended_at < ECHO_TAIL_SECONDS
 
     sink = TranscribingSink(on_utterance, target_user_id=ctx.author.id, is_muted=is_muted)
     vc.listen(sink)
@@ -140,6 +148,29 @@ def _log_utterance_error(future) -> None:
         logger.error("発話の処理に失敗しました", exc_info=future.exception())
 
 
+def post_in_background(ctx: commands.Context, content: str) -> None:
+    """テキストチャンネルへの記録を待たずに投稿する。
+
+    投稿は1回0.3〜0.4秒かかり、待つとその分だけ応答の読み上げが遅れるため裏で送る。
+    投稿順が前後しないよう、直前の投稿が終わってから送る。
+    """
+    previous = text_post_tasks.get(ctx.guild.id)
+
+    async def send() -> None:
+        if previous is not None:
+            await asyncio.gather(previous, return_exceptions=True)
+        await ctx.send(content)
+
+    task = asyncio.create_task(send())
+    task.add_done_callback(_log_post_error)
+    text_post_tasks[ctx.guild.id] = task
+
+
+def _log_post_error(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("テキストチャンネルへの投稿に失敗しました", exc_info=task.exception())
+
+
 def is_filler(text: str) -> bool:
     """意味を持たない言いよどみだけの発話か。「はい」「うん」は質問への答えになりうるので含めない。"""
     normalized = re.sub(r"[\s。、,.!?！？〜…]", "", text)
@@ -171,7 +202,7 @@ async def handle_utterance(ctx: commands.Context, user_id: int, pcm_16k) -> None
             pending_since[ctx.guild.id] = utterance_ended_at
         pending_texts.setdefault(ctx.guild.id, []).append(text)
     logger.info("transcript: %s", text)
-    await ctx.send(f"🎙️ {text}")
+    post_in_background(ctx, f"🎙️ {text}")
 
     task = responder_tasks.get(ctx.guild.id)
     if task is None or task.done():
@@ -224,11 +255,11 @@ async def respond_to_pending(ctx: commands.Context) -> None:
                 if result.tool_log.consulted_modules:
                     logger.info("manual lookup: %s", result.tool_log.consulted_modules)
                     names = "、".join(module_name(module_id) for module_id in result.tool_log.consulted_modules)
-                    await ctx.send(f"📖 マニュアル参照: {names}")
+                    post_in_background(ctx, f"📖 マニュアル参照: {names}")
                 for output in result.tool_log.solver_outputs:
                     logger.info("solver: %s", output)
-                    await ctx.send(f"🧮 {output}")
-            await ctx.send(f"🤖 {reply}")
+                    post_in_background(ctx, f"🧮 {output}")
+            post_in_background(ctx, f"🤖 {reply}")
 
             if ctx.voice_client is not None and reply:
                 await speak(ctx.voice_client, reply, since=pending_since.pop(ctx.guild.id, None))
@@ -250,13 +281,34 @@ async def speak(vc: discord.VoiceClient, text: str, since: float | None = None) 
     await play_source(vc, discord.PCMAudio(io.BytesIO(TURN_CHIME)))
 
 
-async def play_source(vc: discord.VoiceClient, source: discord.AudioSource) -> None:
-    """音声を再生し、再生が終わるまで待つ。"""
+async def play_ack(vc: discord.VoiceClient) -> None:
+    """話し終わりの受け付け音を鳴らす。bot自身の読み上げ中なら邪魔しないよう鳴らさない。"""
+    if not vc.is_connected() or vc.is_playing():
+        return
+    ack_playing[vc.guild.id] = True
+    try:
+        await play_source(vc, discord.PCMAudio(io.BytesIO(ACK_BLIP)), is_ack=True)
+    finally:
+        ack_playing[vc.guild.id] = False
+
+
+async def play_source(vc: discord.VoiceClient, source: discord.AudioSource, is_ack: bool = False) -> None:
+    """音声を再生し、再生が終わるまで待つ。切断済みなら何もしない。"""
+    if not is_ack:
+        # 受け付け音が鳴っている最中なら、鳴り終わるのを待ってから読み上げる
+        while vc.is_connected() and vc.is_playing() and ack_playing.get(vc.guild.id, False):
+            await asyncio.sleep(0.02)
+    if not vc.is_connected():
+        # 読み上げ中にVCから外された場合など。応答処理全体を例外で止めないよう読み上げだけ諦める
+        logger.warning("ボイスチャンネルに接続していないため再生をスキップしました")
+        return
     loop = asyncio.get_running_loop()
     finished = asyncio.Event()
 
     def after(error: Exception | None) -> None:
-        playback_ended_at[vc.guild.id] = time.monotonic()
+        if not is_ack:
+            # 残響待ちはbot自身の読み上げ・ターン交代音の後だけ (受け付け音の後は聞き取りを止めない)
+            playback_ended_at[vc.guild.id] = time.monotonic()
         if error is not None:
             logger.error("音声の再生に失敗しました", exc_info=error)
         loop.call_soon_threadsafe(finished.set)
