@@ -24,6 +24,27 @@ class SpeechSegmenter:
         )
         self._buffer: list[np.ndarray] = []
         self._speaking = False
+        # VADIteratorが発話終了とみなすのに必要な無音フレーム数 (+余裕)
+        self._silence_frames = int(np.ceil(silence_ms * SAMPLE_RATE / 1000 / FRAME_SAMPLES)) + 4
+
+    @property
+    def speaking(self) -> bool:
+        return self._speaking
+
+    def flush(self) -> np.ndarray | None:
+        """発話中なら無音を補って発話を確定させる。
+
+        Discordは話し終わると送信自体を止めるため、無音フレームが届かずVADが発話終了を判定できない。
+        送信が途切れたときにこれを呼び、足りない無音を補ってすぐ確定させる。
+        """
+        silence = np.zeros(FRAME_SAMPLES, dtype=np.float32)
+        for _ in range(self._silence_frames):
+            if not self._speaking:
+                return None
+            utterance = self.push(silence)
+            if utterance is not None:
+                return utterance
+        return None
 
     def push(self, pcm_frame: np.ndarray) -> np.ndarray | None:
         """pcm_frame: float32, 16kHz, mono, FRAME_SAMPLES長。発話確定時はfloat32配列、それ以外はNone。"""
