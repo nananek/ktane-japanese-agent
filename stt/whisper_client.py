@@ -29,6 +29,12 @@ _preload_cuda12_libs()
 
 from faster_whisper import WhisperModel  # noqa: E402
 
+# ゲームで使う語彙を先に与えて認識を寄せる。数の答え (「にほん」→「日本」「ニコン」) や色・ラベルの誤認識が大きく減る
+INITIAL_PROMPT = "電池は2本、3本。ワイヤは赤、青、白、黒、黄色。奇数、偶数。キーパッド、ボタン、起爆、中止、長押し。"
+# initial_prompt を与えると無音・雑音に対してプロンプトの語句を出力することがある。
+# 実測で実際の発話は no_speech_prob 0.16以下、プロンプト由来の幻聴は0.79以上だったため、その間で切る
+NO_SPEECH_PROB_THRESHOLD = 0.5
+
 # 日本語Whisperが雑音や無音に対して出しがちな定型の誤認識 (動画字幕の学習データ由来)
 HALLUCINATION_PHRASES = {
     "ご視聴ありがとうございました",
@@ -51,12 +57,12 @@ class WhisperClient:
 
     def transcribe(self, pcm_16k: np.ndarray) -> str:
         segments, _ = self._model.transcribe(
-            pcm_16k, language="ja", beam_size=5, condition_on_previous_text=False
+            pcm_16k, language="ja", beam_size=5, condition_on_previous_text=False, initial_prompt=INITIAL_PROMPT
         )
         texts = []
         for segment in segments:
             # 雑音・無音をWhisperが発話と取り違えた (幻聴) とみられる区間は捨てる
-            if segment.no_speech_prob > 0.6 and segment.avg_logprob < -0.5:
+            if segment.no_speech_prob > NO_SPEECH_PROB_THRESHOLD:
                 continue
             text = segment.text.strip()
             if text in HALLUCINATION_PHRASES:

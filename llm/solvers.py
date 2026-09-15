@@ -93,8 +93,13 @@ def solve_keypad(symbol_ids: list[str]) -> str:
         return f"候補の列が複数あります ({numbers})。残りの記号も特定してから再度呼んでください。"
 
     index, column = candidates[0]
-    order = [f"{char}({appearance})" for symbol_id, char, appearance in column if symbol_id in wanted]
-    return f"列{index}が該当。押す順番: " + " → ".join(order)
+    order = [(char, name) for symbol_id, char, name in column if symbol_id in wanted]
+    if len(order) < 4:
+        return f"列{index}に絞れたが記号が{len(order)}つしかない。残りの記号も聞いてから再度呼んでください。"
+    return SolverResult(
+        f"列{index}が該当。押す順番: " + " → ".join(f"{char}({name})" for char, name in order),
+        "、".join(name for _, name in order) + "の順に押して。",
+    )
 
 
 # ---------------------------------------------------------------- 記憶

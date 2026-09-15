@@ -168,8 +168,9 @@ def build_tools() -> list[dict]:
         tools.append({
             "name": "solve_keypad",
             "description": (
-                "キーパッドの記号IDから該当する列と押す順番を求める。記号IDはキーパッドのマニュアルの記号表で特定する。"
+                "キーパッドの記号IDから該当する列と押す順番を求める。記号IDはsystem promptのキーパッドの記号表で特定する。"
                 "押す順番は自分で判定せず、必ずこのツールの結果に従うこと。"
+                "Defuserが4つの記号をすべて説明してから呼ぶこと。1つの記号の説明 (例: キリル文字のZH) を複数の記号に分けないこと。"
             ),
             "parameters": {
                 "type": "object",

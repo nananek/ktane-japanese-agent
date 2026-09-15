@@ -50,6 +50,16 @@ def load_module_manual(module_id: str) -> str:
     return _read(f"{module_id}.md") or f"{module_id} のマニュアルは未配置です。"
 
 
+def keypad_symbol_table() -> str:
+    """keypads.md の記号表 (見た目と呼び方) だけを返す。
+
+    キーパッドは記号の特定にこの表が毎回必要で、マニュアル取得に1往復 (約3秒) かかるためsystem promptに常駐させる。
+    """
+    text = _read("keypads.md") or ""
+    match = re.search(r"^## 記号の見た目と呼び方\n(.*?)(?=^## )", text, re.M | re.S)
+    return match.group(1).strip() if match else "(キーパッドの記号表が未配置)"
+
+
 def module_catalog() -> str:
     return "\n".join(f"- {module.id}: {module.name} — {module.appearance}" for module in MODULES)
 
