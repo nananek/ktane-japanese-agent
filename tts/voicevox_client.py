@@ -13,11 +13,14 @@ class VoicevoxClient:
         self._speed_scale = float(os.environ.get("VOICEVOX_SPEED_SCALE", "1.3"))
         self._client = httpx.Client(base_url=base_url, timeout=30.0)
 
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(self, text: str, pause_scale: float | None = None) -> bytes:
+        """pause_scale は句点などの区切りの間の倍率。迷路の経路のように1手ずつ聞き取らせたい読み上げで長くする。"""
         query_res = self._client.post("/audio_query", params={"text": text, "speaker": self._speaker})
         query_res.raise_for_status()
         query = query_res.json()
         query["speedScale"] = self._speed_scale
+        if pause_scale is not None:
+            query["pauseLengthScale"] = pause_scale
 
         synth_res = self._client.post(
             "/synthesis",

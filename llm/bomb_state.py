@@ -24,6 +24,8 @@ class BombState:
     serial_number: str | None = None
     # シリアル全体は聞かず「末尾は奇数」とだけ答えることもあるため、末尾の偶奇だけでも持てるようにする
     serial_last_digit_odd: bool | None = None
+    # 同じくシリアル全体は聞かず「母音はある」とだけ答えることもあるため、母音の有無だけでも持てるようにする
+    serial_has_vowel: bool | None = None
     batteries: int | None = None
     # 点灯インジケーターを全部答えてもらったときだけ設定する (None なら未判明)
     lit_indicators: set[str] | None = None
@@ -44,6 +46,8 @@ class BombState:
     complicated_wires: dict[int, dict] = field(default_factory=dict)
     # 「LEDは右の2つが点灯」のようにまとめて言われた、LED点灯・★ありの位置 (ほかは消灯・なし)。個別の記録より優先度は低い
     complicated_marks: dict[str, set[int]] = field(default_factory=dict)
+    # サイモンゲーム: 光った色の並び。Defuserが増えた色だけを言うこともあるため、ここに積み上げる
+    simon_flashes: list[str] = field(default_factory=list)
     pending_solver: PendingSolver | None = None
 
     def complicated_wire(self, position: int) -> dict:
@@ -72,6 +76,8 @@ class BombState:
             lines.append(f"- シリアルナンバー: {serial} ({last_digit}、{vowel})")
         elif self.serial_last_digit_odd is not None:
             lines.append(f"- シリアルナンバーの最後の数字: {'奇数' if self.serial_last_digit_odd else '偶数'}")
+        if self.serial_number is None and self.serial_has_vowel is not None:
+            lines.append(f"- シリアルナンバーの母音: {'含む' if self.serial_has_vowel else '含まない'}")
         if self.batteries is not None:
             lines.append(f"- バッテリー: {self.batteries}本")
         if self.lit_indicators is not None:
@@ -99,6 +105,9 @@ class BombState:
                 star = {True: "★あり", False: "★なし"}.get(wire.get("star"), "★?")
                 wires.append(f"{position}本目 {color}/{led}/{star}")
             lines.append(f"- 複雑ワイヤ ({self.complicated_wire_count}本): {'、'.join(wires)}")
+        if self.simon_flashes:
+            names = {"red": "赤", "blue": "青", "green": "緑", "yellow": "黄"}
+            lines.append(f"- サイモンゲームで光った色: {'、'.join(names.get(c, c) for c in self.simon_flashes)}")
         if self.wire_sequence_panels:
             panels = "、".join(f"パネル{n}" for n in sorted(self.wire_sequence_panels))
             lines.append(f"- 順番ワイヤで入力済み: {panels}")

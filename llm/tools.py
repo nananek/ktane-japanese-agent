@@ -12,8 +12,10 @@ from .solvers import (
     is_known,
     keypad_symbol_ids,
     load_complicated_wire_rules,
+    load_simon_rules,
     solve_button,
     solve_complicated_wires,
+    solve_simon_says,
     solve_keypad,
     solve_maze,
     solve_memory,
@@ -36,7 +38,7 @@ GAME_END_SPEECH = {
 }
 BUTTON_LABELS = ("中止", "起爆", "長押し", "押す", "その他")
 # 爆弾の情報が足りないと判定を保留するソルバー。聞き返した情報が記録されたらその場で判定し直す
-PENDABLE_SOLVERS = ("solve_wires", "solve_button", "solve_complicated_wires")
+PENDABLE_SOLVERS = ("solve_wires", "solve_button", "solve_complicated_wires", "solve_simon_says")
 
 
 @dataclass
@@ -47,6 +49,8 @@ class ToolLog:
     solver_outputs: list[str] = field(default_factory=list)
     # 直近のソルバーが返した、LLMを通さずそのまま読み上げてよい発話
     final_speech: str | None = None
+    # final_speech を読み上げるときの句点の間の倍率 (ソルバーが指定したときだけ)
+    final_speech_pause_scale: float | None = None
 
 
 MAZE_POSITION = {
@@ -81,6 +85,8 @@ def build_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "serial_number": {"type": ["string", "null"], "description": "シリアルナンバー (英数字)。未言及なら null"},
+                    "serial_has_vowel": {"type": ["boolean", "null"],
+                                         "description": "シリアル全体ではなく母音 (A,E,I,O,U) の有無だけ判明したとき、含むなら true・含まないなら false。それ以外は null"},
                     "serial_last_digit_odd": {"type": ["boolean", "null"],
                                               "description": "シリアル全体ではなく末尾の数字の偶奇だけ判明したとき、奇数なら true・偶数なら false。それ以外は null"},
                     "batteries": {"type": ["integer", "null"], "minimum": 0, "description": "バッテリーの合計本数。未言及なら null"},
@@ -97,7 +103,7 @@ def build_tools() -> list[dict]:
                     "strike_occurred": {"type": ["boolean", "null"],
                                         "description": "Defuserがミスの発生を報告したら true (「ミス」「ミス1回」「ミスった」「ストライク」など、合計と明言していないもの)。記録済みのミス数に1を足す。それ以外は null"},
                 },
-                "required": ["serial_number", "serial_last_digit_odd", "batteries", "lit_indicators",
+                "required": ["serial_number", "serial_has_vowel", "serial_last_digit_odd", "batteries", "lit_indicators",
                              "not_lit_indicators", "unlit_indicators", "ports", "strikes", "strike_occurred"],
             },
         },
@@ -212,6 +218,26 @@ def build_tools() -> list[dict]:
             },
         },
     ]
+    if load_simon_rules():
+        tools.append({
+            "name": "solve_simon_says",
+            "description": (
+                "サイモンゲーム (赤・青・緑・黄のボタンが順に光る) で押す色の順番を求める。自分で表を引かず必ずこのツールを使うこと。"
+                "光った色の並びはツールが記録し、押す色はシリアルの母音と記録済みのミス数から決めるので、ミス数は聞かないこと。"
+                "母音が分からず答えが変わる場合だけ母音を聞き返す文を返し、その答えを update_bomb_info で記録すれば判定が自動でやり直される。"
+                "結果の「〜の順に押して」をそのまま伝えること。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flashes": {"type": "array", "items": {"type": "string", "enum": ["red", "blue", "green", "yellow"]},
+                                "description": "Defuserが言った光った色を順に"},
+                    "only_new": {"type": "boolean",
+                                 "description": "Defuserが前回から増えた色だけを言ったとき true (記録済みの並びの後ろに足す)。最初から全部言ったときは false"},
+                },
+                "required": ["flashes", "only_new"],
+            },
+        })
     if load_complicated_wire_rules()[0]:
         tools.append({
             "name": "solve_complicated_wires",
@@ -352,6 +378,8 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
             output = solve_whos_on_first(
                 list(args["display_candidates"]), list(args["buttons"]), bool(args.get("kanji_confirmed"))
             )
+        elif name == "solve_simon_says":
+            output = solve_simon_says(state, list(args.get("flashes") or []), bool(args.get("only_new")))
         elif name == "solve_complicated_wires":
             output = solve_complicated_wires(
                 state, args.get("wire_count"), list(args.get("wires") or []),
@@ -374,8 +402,10 @@ def run_tool(name: str, arguments: str, state: BombState, log: ToolLog) -> str:
         return f"引数が不正です ({e}): {arguments}"
     if isinstance(output, SolverResult):
         log.final_speech = output.speech
+        log.final_speech_pause_scale = output.speech_pause_scale
         if output.missing and name in PENDABLE_SOLVERS:
-            state.pending_solver = PendingSolver(name, arguments, list(output.missing))
+            pending_arguments = arguments if output.rerun_arguments is None else json.dumps(output.rerun_arguments)
+            state.pending_solver = PendingSolver(name, pending_arguments, list(output.missing))
         output = output.text
     else:
         log.final_speech = None
@@ -408,6 +438,8 @@ def _update_bomb_info(state: BombState, args: dict) -> str:
     # null (未言及) の項目は既存の記録を残す
     if args.get("serial_number"):
         state.serial_number = str(args["serial_number"]).upper().replace(" ", "")
+    if args.get("serial_has_vowel") is not None:
+        state.serial_has_vowel = bool(args["serial_has_vowel"])
     if args.get("serial_last_digit_odd") is not None:
         state.serial_last_digit_odd = bool(args["serial_last_digit_odd"])
     if args.get("batteries") is not None:

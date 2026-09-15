@@ -10,7 +10,7 @@ import re
 from collections import deque
 from dataclasses import dataclass
 
-from .bomb_state import BombState
+from .bomb_state import VOWELS, BombState
 from .manual import KNOWLEDGE_DIR
 
 KANJI_ORDINALS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
@@ -27,6 +27,10 @@ class SolverResult:
     speech: str | None = None
     # 判定に足りない爆弾の情報の名前。記録されたら同じ呼び出しで判定し直せるようにする
     missing: tuple[str, ...] = ()
+    # 区切り (句点) の間の長さの倍率。迷路の経路のように、聞きながら1手ずつ操作する読み上げで間を少し長くする
+    speech_pause_scale: float | None = None
+    # 判定し直すときの引数。呼び出しで状態に積み上げる入力 (増えた色など) は、同じ引数のままだと二重に積まれるため差し替える
+    rerun_arguments: dict | None = None
 
 
 def _read(file_name: str) -> str | None:
@@ -277,11 +281,66 @@ def solve_wire_sequence(state: BombState, panel: int | None, wires: list[dict]) 
     return SolverResult(f"パネル{panel}: " + "、".join(results), speech)
 
 
+# ---------------------------------------------------------------- サイモンゲーム
+
+SIMON_SECTION_RE = re.compile(r"^## シリアルナンバーに母音が含まれて(いる|いない)場合\n(.*?)(?=^## |\Z)", re.M | re.S)
+SIMON_ROW_RE = re.compile(r"^\| (赤|青|緑|黄) \| (赤|青|緑|黄) \| (赤|青|緑|黄) \| (赤|青|緑|黄) \|$", re.M)
+SIMON_COLORS = {"赤": "red", "青": "blue", "緑": "green", "黄": "yellow"}
+
+
+def load_simon_rules() -> dict[bool, dict[str, list[str]]]:
+    """simon-says.md を {母音あり: {光った色: [ミスなし, 1ミス後, 2ミス後 に押す色]}} として返す。未配置なら空。"""
+    text = _read("simon-says.md")
+    if text is None:
+        return {}
+    return {
+        has_vowel == "いる": {
+            SIMON_COLORS[flash]: [SIMON_COLORS[color] for color in presses]
+            for flash, *presses in SIMON_ROW_RE.findall(body)
+        }
+        for has_vowel, body in SIMON_SECTION_RE.findall(text)
+    }
+
+
+def solve_simon_says(state: BombState, flashes: list[str], only_new: bool) -> SolverResult | str:
+    rules = load_simon_rules()
+    if any(color not in SIMON_COLORS.values() for color in flashes):
+        return "色は red/blue/green/yellow で指定してください。"
+    if only_new:
+        state.simon_flashes.extend(flashes)
+    elif flashes:
+        state.simon_flashes = list(flashes)
+    if not state.simon_flashes:
+        return SolverResult("光った色がまだ分かりません。", "光った色は？")
+
+    has_vowel = _serial_has_vowel(state)
+    # 押す色は現在のミス数で変わる。ミスの報告は update_bomb_info で数えているので、記録がなければミスなしとみなす
+    strikes = min(state.strikes or 0, 2)
+    names = {english: japanese for japanese, english in SIMON_COLORS.items()}
+    if has_vowel is None:
+        answers = {tuple(rules[v][flash][strikes] for flash in state.simon_flashes) for v in (True, False)}
+        if len(answers) > 1:
+            result = _missing_message(["serial_vowel"])
+            # 色は記録済みなので、判定し直すときは積み上げずに今の並びをそのまま使う
+            return SolverResult(result.text, result.speech, result.missing, {"flashes": state.simon_flashes, "only_new": False})
+        presses = list(answers.pop())
+    else:
+        presses = [rules[has_vowel][flash][strikes] for flash in state.simon_flashes]
+    flashed = "、".join(names[c] for c in state.simon_flashes)
+    order = "、".join(names[c] for c in presses)
+    speech = f"{order}を押して。" if len(presses) == 1 else f"{order}の順に押して。"
+    return SolverResult(f"光った色 {flashed} (ミス{strikes}回) → {order} の順に押す。", speech)
+
+
 # ---------------------------------------------------------------- 迷路
 
 MAZE_SECTION_RE = re.compile(r"^### (maze\d) \(丸印の位置: (.+?)\)\n```\n(.*?)\n```", re.M | re.S)
 MAZE_SIZE = 6
 DIRECTIONS = {"上": (-1, 0), "下": (1, 0), "左": (0, -1), "右": (0, 1)}
+# 経路の読み上げの句点の間 (VOICEVOX の pauseLengthScale)。1.0で約0.44秒 (話速で短くなる)。長すぎると間延びするので少しだけ長くする
+MAZE_PAUSE_SCALE = 1.5
+# 経路を読み上げるときに区切る手数
+MAZE_SPEECH_CHUNK = 3
 
 
 @dataclass(frozen=True)
@@ -371,7 +430,14 @@ def solve_maze(circles: list[dict], start: dict, goal: dict) -> str:
         else:
             grouped.append([direction, 1])
     moves_text = "、".join(f"{d}{n}" for d, n in grouped)
-    return SolverResult(f"{maze.name}が該当。押す順番: {moves_text}", f"{moves_text}。")
+    # 「右2、下1、左3」を一息に読むと聞きながら操作できないため、前振りを入れ、方向を3つずつ区切って読む
+    # (「右右下。左下右。」。区切りの中は続けて読み、区切りごとに少し長めの間を入れる)
+    steps = "".join(
+        "".join(moves[i:i + MAZE_SPEECH_CHUNK]) + "。" for i in range(0, len(moves), MAZE_SPEECH_CHUNK)
+    )
+    return SolverResult(
+        f"{maze.name}が該当。押す順番: {moves_text}", f"経路を読み上げます。{steps}", speech_pause_scale=MAZE_PAUSE_SCALE
+    )
 
 
 # ---------------------------------------------------------------- ワイヤ・ボタン共通 (条件付きルールの評価)
@@ -386,9 +452,10 @@ COLOR_RE = "(赤|青|黄色|白|黒)"
 UNKNOWN_VARIABLE_LABELS = {
     "serial_odd": "シリアルナンバーの最後の数字が奇数か",
     "batteries": "バッテリーの本数",
+    "serial_vowel": "シリアルナンバーに母音 (A,E,I,O,U) が含まれるか",
 }
 # 読み上げ用の短い聞き方
-QUESTION_LABELS = {"serial_odd": "シリアルの末尾は奇数", "batteries": "電池は何本"}
+QUESTION_LABELS = {"serial_odd": "シリアルの末尾は奇数", "batteries": "電池は何本", "serial_vowel": "シリアルに母音はある"}
 
 
 def _split_rule(sentence: str) -> tuple[list[str], str]:
@@ -448,8 +515,16 @@ def _missing_message(names: list[str]) -> SolverResult:
     )
 
 
+def _serial_has_vowel(state: BombState) -> bool | None:
+    if state.serial_number is not None:
+        return bool(VOWELS & set(state.serial_number.upper()))
+    return state.serial_has_vowel
+
+
 def is_known(state: BombState, name: str) -> bool:
     """_missing_message で聞いた情報が記録済みか。"""
+    if name == "serial_vowel":
+        return _serial_has_vowel(state) is not None
     if name == "serial_odd":
         return _serial_odd(state) is not None
     if name == "batteries":

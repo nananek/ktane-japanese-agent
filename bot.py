@@ -46,8 +46,9 @@ responder_tasks: dict[int, asyncio.Task] = {}
 text_post_tasks: dict[int, asyncio.Task] = {}
 # 応答生成中に新しい発話が届いたときに作り直す上限回数 (話し続けられても応答が返らなくならないように)
 MAX_REGENERATIONS = 2
-# 直前にbotが読み上げた内容 (聞き返し用)
+# 直前にbotが読み上げた内容と、その句点の間の倍率 (聞き返し用)
 last_replies: dict[int, str] = {}
+last_reply_pause_scales: dict[int, float | None] = {}
 # 読み上げ終了後も聞き取りを止めておく秒数 (スピーカーからの残響をbot自身の声として拾わないように)。
 # 最後に鳴るのは短く減衰の速いチャイムなので短めでよく、長いとチャイム直後の話し始めが削られる
 ECHO_TAIL_SECONDS = 0.3
@@ -214,6 +215,7 @@ async def announce_opening(conv: Conversation) -> None:
     async with lock:
         sessions.get_or_create(conv.guild.id).add_assistant_message(opening_line)
         last_replies[conv.guild.id] = opening_line
+        last_reply_pause_scales[conv.guild.id] = None
         logger.info("reply (opening): %s", opening_line)
         await conv.channel.send(f"🤖 {opening_line}")
         if conv.voice_client is not None:
@@ -276,7 +278,7 @@ async def repeat_last_reply(conv: Conversation) -> None:
         logger.info("reply (repeat): %s", reply)
         post_in_background(conv, f"🤖 {reply}")
         if conv.voice_client is not None:
-            await speak(conv.voice_client, reply)
+            await speak(conv.voice_client, reply, pause_scale=last_reply_pause_scales.get(conv.guild.id))
 
 
 async def handle_utterance(conv: Conversation, user_id: int, pcm_16k) -> None:
@@ -357,20 +359,30 @@ async def respond_to_pending(conv: Conversation) -> None:
             # 監視中に答えの正否を確かめられるよう、読み上げる内容をログにも残す
             logger.info("reply: %s", reply)
             post_in_background(conv, f"🤖 {reply}")
+            # ソルバーの定型文をそのまま読むときだけ、ソルバーが指定した間の長さを使う
+            pause_scale = (
+                result.tool_log.final_speech_pause_scale
+                if result is not None and reply == result.tool_log.final_speech else None
+            )
             if reply and reply != LLM_FAILURE_REPLY:
                 last_replies[conv.guild.id] = reply
+                last_reply_pause_scales[conv.guild.id] = pause_scale
 
             if conv.voice_client is not None and reply:
-                await speak(conv.voice_client, reply, since=pending_since.pop(conv.guild.id, None))
+                await speak(
+                    conv.voice_client, reply, since=pending_since.pop(conv.guild.id, None), pause_scale=pause_scale
+                )
 
 
-async def speak(vc: discord.VoiceClient, text: str, since: float | None = None) -> None:
+async def speak(
+    vc: discord.VoiceClient, text: str, since: float | None = None, pause_scale: float | None = None
+) -> None:
     """読み上げに続けてターン交代のチャイムを鳴らし、鳴り終わるまで待つ。
 
     チャイムが鳴り終わると聞き取りが再開するので、Defuserはチャイムを話し始めの合図にできる。
     """
     tts_started_at = time.monotonic()
-    wav_bytes = await asyncio.to_thread(voicevox.synthesize, text)
+    wav_bytes = await asyncio.to_thread(voicevox.synthesize, text, pause_scale)
     now = time.monotonic()
     if since is None:
         logger.info("timing: tts %.2fs", now - tts_started_at)
