@@ -12,10 +12,11 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # torchはsilero-vad (CPUで十分) にしか使わないため、数GBあるCUDA版ではなくCPU版を先に入れておく。
+# silero-vadが依存するtorchaudioもCPU版にする (PyPI版はCUDA 13ビルドで、libcudart.so.13がなく読み込めない)。
 # faster-whisper のGPU推論に要るCUDA 12ライブラリは requirements.txt の nvidia-* パッケージが持ち込み、
 # ドライバはホストの NVIDIA Container Toolkit から渡される
 COPY requirements.txt .
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
+RUN pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r requirements.txt
 
 COPY . .
