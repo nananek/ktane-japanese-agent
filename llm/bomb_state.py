@@ -13,7 +13,10 @@ class BombState:
     # シリアル全体は聞かず「末尾は奇数」とだけ答えることもあるため、末尾の偶奇だけでも持てるようにする
     serial_last_digit_odd: bool | None = None
     batteries: int | None = None
+    # 点灯インジケーターを全部答えてもらったときだけ設定する (None なら未判明)
     lit_indicators: set[str] | None = None
+    # 「FRKは点灯していない」のように個別に点灯していないと分かったもの。全体が判明したとは扱わない
+    not_lit_indicators: set[str] = field(default_factory=set)
     unlit_indicators: set[str] | None = None
     ports: set[str] | None = None
     strikes: int | None = None
@@ -38,6 +41,8 @@ class BombState:
             lines.append(f"- バッテリー: {self.batteries}本")
         if self.lit_indicators is not None:
             lines.append(f"- 点灯インジケーター: {'、'.join(sorted(self.lit_indicators)) or 'なし'}")
+        if self.lit_indicators is None and self.not_lit_indicators:
+            lines.append(f"- 点灯していないと分かったインジケーター: {'、'.join(sorted(self.not_lit_indicators))}")
         if self.unlit_indicators is not None:
             lines.append(f"- 消灯インジケーター: {'、'.join(sorted(self.unlit_indicators)) or 'なし'}")
         if self.ports is not None:

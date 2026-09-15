@@ -533,12 +533,14 @@ def solve_button(state: BombState, color: str, label: str, strip_color: str | No
         for atom in atoms:
             for indicator in re.findall(r"「([A-Z]+)」という点灯したインジケーター", atom):
                 key = f"lit_{indicator}"
-                if state.lit_indicators is None:
+                if state.lit_indicators is not None:
+                    known[key] = indicator in state.lit_indicators
+                elif indicator in state.not_lit_indicators:
+                    known[key] = False
+                else:
                     unknowns[key] = [False, True]
                     UNKNOWN_VARIABLE_LABELS.setdefault(key, f"点灯した{indicator}インジケーターがあるか")
                     QUESTION_LABELS.setdefault(key, f"点灯した{indicator}はある")
-                else:
-                    known[key] = indicator in state.lit_indicators
 
     action, missing = _decide(
         rules, _button_atom, known, unknowns, resolve=lambda action, env: "tap" if "すぐに離す" in action else "hold"
@@ -548,9 +550,71 @@ def solve_button(state: BombState, color: str, label: str, strip_color: str | No
     if action == "tap":
         return SolverResult("ボタンを押してすぐに離す。", "押してすぐ離して。")
     if strip_color is None:
+        # 帯の色を聞き返すと1往復増えるうえ、ボタンの色と取り違えやすいので、離すタイミングを全色分まとめて伝える
+        other = release.get("other")
+        names = {v: k for k, v in COLOR_NAMES.items()}
+        specific = "、".join(f"{names[color]}なら{digit}" for color, digit in release.items() if color != "other" and digit != other)
+        timing = f"帯が{specific}、それ以外は{other}" if specific else f"帯の色によらず{other}"
         return SolverResult(
-            "ボタンを押したままにして、右側に光る帯の色を聞く。帯の色を strip_color に指定して再度呼ぶ。",
-            "押したまま、帯の色は？",
+            f"ボタンを押したままにする。離すタイミング: {timing}が表示されたとき。",
+            f"押したまま。{timing}が出たら離して。",
         )
     digit = release.get(strip_color, release.get("other"))
     return SolverResult(f"帯が{strip_color}なので、タイマーのどこかの桁に{digit}が表示されたときに離す。", f"タイマーに{digit}が出たら離して。")
+
+
+# ---------------------------------------------------------------- 表比較
+
+WOF_STEP1_RE = re.compile(r"^## ステップ1.*?\n(.*?)(?=^## )", re.M | re.S)
+WOF_STEP2_RE = re.compile(r"^## ステップ2.*?\n(.*)", re.M | re.S)
+WOF_POSITION_RE = re.compile(r"^\| (.+?) \| ([123])行目-(左|右) \|$", re.M)
+WOF_PRIORITY_RE = re.compile(r"^\| (.+?) \| (.+?) \|$", re.M)
+WOF_EMPTY_DISPLAY = "空欄"
+# ボタンの位置を読み上げる順番。ステップ1の「N行目-左/右」と対応させる
+WOF_POSITIONS = ("左上", "右上", "左中", "右中", "左下", "右下")
+
+
+def load_whos_on_first() -> tuple[dict[str, int], dict[str, list[str]]]:
+    """whos-on-first.md を ({表示語: ボタン位置の添字}, {読んだ単語: 押す優先順位}) として返す。未配置なら空。"""
+    text = _read("whos-on-first.md")
+    if text is None:
+        return {}, {}
+    positions = {}
+    for display, row, side in WOF_POSITION_RE.findall(WOF_STEP1_RE.search(text).group(1)):
+        key = WOF_EMPTY_DISPLAY if "空欄" in display else display
+        positions[key] = (int(row) - 1) * 2 + (0 if side == "左" else 1)
+    priorities = {
+        word: [w.strip() for w in order.split(",")]
+        for word, order in WOF_PRIORITY_RE.findall(WOF_STEP2_RE.search(text).group(1))
+        if "," in order
+    }
+    return positions, priorities
+
+
+def solve_whos_on_first(display_candidates: list[str], buttons: list[str]) -> SolverResult | str:
+    positions, priorities = load_whos_on_first()
+    if len(buttons) != 6:
+        return f"ボタンは {'・'.join(WOF_POSITIONS)} の順に6つ指定してください。"
+    unknown = [word for word in buttons if word not in priorities]
+    if unknown:
+        return f"表にないボタンの文字があります: {'、'.join(unknown)}。その位置のボタンの文字を聞き返してください。"
+
+    outcomes: dict[str, tuple[str, str]] = {}
+    for display in dict.fromkeys(display_candidates):
+        if display not in positions:
+            return f"表にない表示語です: {display}。表示の文字を聞き返してください。"
+        read_word = buttons[positions[display]]
+        press = next((word for word in priorities[read_word] if word in buttons), None)
+        if press is None:
+            return f"「{read_word}」の優先順位リストに該当するボタンがありません。ボタンの文字を聞き返してください。"
+        outcomes[display] = (read_word, press)
+
+    presses = {press for _, press in outcomes.values()}
+    if len(presses) > 1:
+        # 同じ読みの表示語 (大正/対照/対称/大賞 など) で押すボタンが変わる。答えを分ける漢字だけを聞く
+        choices = "、".join(f"「{display}」" for display in outcomes)
+        return SolverResult(f"表示語の候補によって押すボタンが変わります: {choices}", f"表示の漢字は{choices}のどれ？")
+    press = presses.pop()
+    position = WOF_POSITIONS[buttons.index(press)]
+    detail = " / ".join(f"表示「{d}」→ {WOF_POSITIONS[positions[d]]}の「{r}」を読む" for d, (r, _) in outcomes.items())
+    return SolverResult(f"{detail} → {position}の「{press}」を押す。", f"{position}の「{press}」を押して。")
