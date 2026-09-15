@@ -318,14 +318,15 @@ def solve_simon_says(state: BombState, flashes: list[str], only_new: bool) -> So
     strikes = min(state.strikes or 0, 2)
     names = {english: japanese for japanese, english in SIMON_COLORS.items()}
     if has_vowel is None:
-        answers = {tuple(rules[v][flash][strikes] for flash in state.simon_flashes) for v in (True, False)}
-        if len(answers) > 1:
-            result = _missing_message(["serial_vowel"])
-            # 色は記録済みなので、判定し直すときは積み上げずに今の並びをそのまま使う
-            return SolverResult(result.text, result.speech, result.missing, {"flashes": state.simon_flashes, "only_new": False})
-        presses = list(answers.pop())
-    else:
-        presses = [rules[has_vowel][flash][strikes] for flash in state.simon_flashes]
+        # 今の色では母音によらず答えが同じでも、光る色が増えればほぼ必ず要るので最初に聞く
+        # (途中で聞くと「確認するの遅くない？」と言われ、ボタンを押す流れも止まった)
+        result = _missing_message(["serial_vowel"])
+        # 色は記録済みなので、判定し直すときは積み上げずに今の並びをそのまま使う
+        return SolverResult(
+            result.text, result.speech,
+            missing=result.missing, rerun_arguments={"flashes": list(state.simon_flashes), "only_new": False},
+        )
+    presses = [rules[has_vowel][flash][strikes] for flash in state.simon_flashes]
     flashed = "、".join(names[c] for c in state.simon_flashes)
     order = "、".join(names[c] for c in presses)
     speech = f"{order}を押して。" if len(presses) == 1 else f"{order}の順に押して。"
@@ -507,10 +508,12 @@ def _serial_odd(state: BombState) -> bool | None:
 
 def _missing_message(names: list[str]) -> SolverResult:
     items = "、".join(UNKNOWN_VARIABLE_LABELS.get(n, n) for n in names)
+    # 一度に3つ聞くとDefuserが答えきれなかったため、1つずつ聞く。答えが記録されると判定し直し、まだ要れば次を聞く
+    first = names[0]
     return SolverResult(
-        f"判定には次の情報が必要です: {items}。これらをまとめて1回で聞き、答えを update_bomb_info で記録してください"
-        " (記録するとこの判定を自動でやり直すので、呼び直さなくてよい)。",
-        "、".join(QUESTION_LABELS.get(n, UNKNOWN_VARIABLE_LABELS.get(n, n)) for n in names) + "？",
+        f"判定には次の情報が必要です: {items}。1つずつ聞くので、まず「{UNKNOWN_VARIABLE_LABELS.get(first, first)}」だけを聞き、"
+        "答えを update_bomb_info で記録してください (記録するとこの判定を自動でやり直し、残りが要ればそれを聞く)。",
+        QUESTION_LABELS.get(first, UNKNOWN_VARIABLE_LABELS.get(first, first)) + "？",
         missing=tuple(names),
     )
 
@@ -760,17 +763,24 @@ def solve_complicated_wires(
         return SolverResult("複雑ワイヤの本数が分かりません。本数を聞いてください。", "ワイヤは何本？")
 
     current = {position: state.complicated_wire(position) for position in range(1, count + 1)}
-    missing = []
-    for key, label in (("colors", "色"), ("led", "LED"), ("star", "★")):
-        positions = [position for position, wire in current.items() if key not in wire]
-        if positions:
-            missing.append(f"{_positions_label(positions, count)}{label}")
-    if missing:
-        # 分かった分は記録済みなので、足りない項目だけを聞く (最初から聞き直すと時間を失う)
-        prefix = "左から順に、" if len(missing) == 3 and not state.complicated_wires and not state.complicated_marks else ""
+    labels = {"colors": "色", "led": "LED", "star": "★"}
+    missing = {key: [p for p, wire in current.items() if key not in wire] for key in labels}
+    if any(missing.values()):
+        # 分かった分は記録済みなので、足りない項目だけを短く聞く (最初から聞き直すと時間を失い、全部並べると長すぎた)
+        described = "、".join(f"{_positions_label(ps, count)}{labels[key]}" for key, ps in missing.items() if ps)
+        key, positions = next((key, ps) for key, ps in missing.items() if ps)
+        if len(positions) == count:
+            # どのワイヤもこの項目が分からない (「★は？」)。まだ何も聞けていなければ全部を順に聞く
+            items = [labels[k] for k, ps in missing.items() if len(ps) == count]
+            prefix = "左から順に、" if len(items) == 3 else ""
+            speech = f"{prefix}{'、'.join(items)}は？"
+        else:
+            # 1本ずつ言われている途中なので、次のワイヤだけを聞く
+            position = positions[0]
+            items = [labels[k] for k, ps in missing.items() if position in ps]
+            speech = f"{ORDINALS[position - 1]}は？" if len(items) == 3 else f"{ORDINALS[position - 1]}の{'、'.join(items)}は？"
         return SolverResult(
-            f"記録しました。まだ分からない項目: {'、'.join(missing)}。聞き取れた分から続けてこのツールに入れてください。",
-            f"{prefix}{'、'.join(missing)}は？",
+            f"記録しました。まだ分からない項目: {described}。聞き取れた分から続けてこのツールに入れてください。", speech
         )
 
     codes = []

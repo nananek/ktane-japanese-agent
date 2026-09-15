@@ -19,7 +19,7 @@ class VoicevoxClient:
         query_res.raise_for_status()
         query = query_res.json()
         query["speedScale"] = self._speed_scale
-        if pause_scale is not None:
+        if isinstance(pause_scale, (int, float)):
             query["pauseLengthScale"] = pause_scale
 
         synth_res = self._client.post(
