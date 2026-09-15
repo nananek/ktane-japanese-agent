@@ -1,12 +1,15 @@
 import uuid
 from dataclasses import dataclass, field
 
+from llm.bomb_state import BombState
+
 
 @dataclass
 class BombSession:
     guild_id: int
     defuser_user_id: int | None = None
     history: list[dict] = field(default_factory=list)
+    state: BombState = field(default_factory=BombState)
     # LLM APIへ会話単位のIDとして渡す。!newbombでセッションごと作り直されるため爆弾1個につき1ID
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 

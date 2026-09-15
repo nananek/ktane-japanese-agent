@@ -1,7 +1,9 @@
 import asyncio
+import copy
 import io
 import logging
 import os
+import time
 
 import discord
 from discord.ext import commands, voice_recv
@@ -38,10 +40,12 @@ responder_tasks: dict[int, asyncio.Task] = {}
 # 応答生成中に新しい発話が届いたときに作り直す上限回数 (話し続けられても応答が返らなくならないように)
 MAX_REGENERATIONS = 2
 LLM_FAILURE_REPLY = "すみません、応答が取れませんでした。もう一度言ってください。"
+# 読み上げ終了後も聞き取りを止めておく秒数 (スピーカーからの残響をbot自身の声として拾わないように)
+ECHO_TAIL_SECONDS = 0.5
+playback_ended_at: dict[int, float] = {}
 whisper = WhisperClient()
 llm = LLMClient()
 voicevox = VoicevoxClient()
-system_prompt = build_system_prompt()
 manual_version, manual_code = find_manual_version()
 # 開始時にマニュアルの版を伝え、Defuserがゲーム側の認証コードと一致しているか確認できるようにする
 opening_line = (
@@ -77,7 +81,14 @@ async def join(ctx: commands.Context) -> None:
         future = asyncio.run_coroutine_threadsafe(handle_utterance(ctx, user_id, pcm_16k), bot.loop)
         future.add_done_callback(_log_utterance_error)
 
-    sink = TranscribingSink(on_utterance, target_user_id=ctx.author.id)
+    guild_id = ctx.guild.id
+
+    def is_muted() -> bool:
+        # 読み上げ中と、読み上げ終了直後の残響が消えるまでは聞かない (半二重)
+        ended_at = playback_ended_at.get(guild_id, 0.0)
+        return vc.is_playing() or time.monotonic() - ended_at < ECHO_TAIL_SECONDS
+
+    sink = TranscribingSink(on_utterance, target_user_id=ctx.author.id, is_muted=is_muted)
     vc.listen(sink)
     await ctx.send(f"{channel.name} に接続しました。{ctx.author.display_name} さんの発話を待ち受けます。")
     await announce_opening(ctx)
@@ -160,9 +171,16 @@ async def respond_to_pending(ctx: commands.Context) -> None:
                 texts.extend(pending)
                 pending.clear()
                 user_message = {"role": "user", "content": "\n".join(texts)}
+                # ツールが書き換える状態はコピーに対して試し、応答を採用したときだけ反映する
+                # (作り直しで捨てた応答のソルバー記録が残ると、記憶や順番ワイヤの数え方が狂うため)
+                attempt_state = copy.deepcopy(session.state)
                 try:
                     result = await asyncio.to_thread(
-                        llm.reply, system_prompt, [*session.history, user_message], session.session_id
+                        llm.reply,
+                        build_system_prompt(attempt_state),
+                        [*session.history, user_message],
+                        session.session_id,
+                        attempt_state,
                     )
                 except Exception:
                     # タイムアウト等。無言で止まるとDefuserが待ち続けてしまうので、言い直しを促す
@@ -179,12 +197,13 @@ async def respond_to_pending(ctx: commands.Context) -> None:
                 reply = LLM_FAILURE_REPLY
             else:
                 session.history.extend(result.messages)
+                session.state = attempt_state
                 reply = result.text
-                if result.consulted_modules:
-                    logger.info("manual lookup: %s", result.consulted_modules)
-                    names = "、".join(module_name(module_id) for module_id in result.consulted_modules)
+                if result.tool_log.consulted_modules:
+                    logger.info("manual lookup: %s", result.tool_log.consulted_modules)
+                    names = "、".join(module_name(module_id) for module_id in result.tool_log.consulted_modules)
                     await ctx.send(f"📖 マニュアル参照: {names}")
-                for output in result.solver_outputs:
+                for output in result.tool_log.solver_outputs:
                     logger.info("solver: %s", output)
                     await ctx.send(f"🧮 {output}")
             await ctx.send(f"🤖 {reply}")
@@ -200,6 +219,7 @@ async def play_wav(vc: discord.VoiceClient, wav_bytes: bytes) -> None:
     finished = asyncio.Event()
 
     def after(error: Exception | None) -> None:
+        playback_ended_at[vc.guild.id] = time.monotonic()
         if error is not None:
             logger.error("読み上げの再生に失敗しました", exc_info=error)
         loop.call_soon_threadsafe(finished.set)
