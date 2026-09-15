@@ -1,0 +1,12 @@
+# 非公開のマニュアル書き起こしと秘密情報はイメージに入れない
+knowledge/
+.env
+
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.claude/
+docker-compose.yml

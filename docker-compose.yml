@@ -1,0 +1,31 @@
+services:
+  bot:
+    image: ghcr.io/nananek/ktane-japanese-agent:latest
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 同じcomposeネットワーク内のVOICEVOXを使う
+      VOICEVOX_BASE_URL: http://voicevox:50021
+    volumes:
+      # マニュアルの書き起こし (非公開リポジトリ) はイメージに含めずマウントする
+      - ./knowledge:/app/knowledge:ro
+      # Whisperのモデルを再起動のたびにダウンロードし直さないよう保存しておく
+      - whisper-models:/root/.cache/huggingface
+    depends_on:
+      - voicevox
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  voicevox:
+    # WhisperとGPUメモリを取り合わないようCPU版を使う
+    image: voicevox/voicevox_engine:cpu-latest
+    restart: unless-stopped
+
+volumes:
+  whisper-models:

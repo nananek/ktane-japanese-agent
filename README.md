@@ -65,7 +65,39 @@ GPU (CUDA) でfaster-whisperを動かす場合、環境のCUDA/cuDNNバージョ
 別プロセスとしてVOICEVOX ENGINEをローカルで起動しておく (Docker推奨)。
 起動後、`http://127.0.0.1:50021` で待ち受けていることを確認する。
 
-### 4. 環境変数の設定
+### 4. Discord botの準備
+
+[Discord Developer Portal](https://discord.com/developers/applications) でアプリケーションを作成し、以下を設定する。
+
+**Bot** タブ
+
+- **Reset Token** でトークンを発行し、`.env` の `DISCORD_TOKEN` に設定する
+- **Privileged Gateway Intents** (PRESENCE / SERVER MEMBERS / MESSAGE CONTENT) はすべて不要 (OFFのままでよい)。
+  スラッシュコマンドだけで操作し、メッセージ本文やメンバー一覧は読まない
+
+**OAuth2 → URL Generator** で招待URLを作り、サーバーに招待する
+
+- SCOPES: `bot`、`applications.commands` (スラッシュコマンドの登録に必要)
+- BOT PERMISSIONS:
+
+| 権限 | 用途 |
+|------|------|
+| View Channels (チャンネルを見る) | コマンドを実行したテキストチャンネル・ボイスチャンネルを参照する |
+| Send Messages (メッセージを送信) | 文字起こし (🎙️)・応答 (🤖)・ソルバーの結果 (🧮) をテキストチャンネルに記録する |
+| Connect (接続) | ボイスチャンネルに参加する |
+| Speak (発言) | 指示の読み上げ・効果音を再生する |
+| Use Voice Activity (音声検出を使用) | プッシュ・トゥ・トークが必須のチャンネルでも常時送信できるようにする |
+
+権限の整数値は `36703232`。以下の `<CLIENT_ID>` をアプリケーションIDに置き換えても招待できる:
+
+```
+https://discord.com/oauth2/authorize?client_id=<CLIENT_ID>&scope=bot+applications.commands&permissions=36703232
+```
+
+ボイスチャンネルやテキストチャンネル側で権限を個別に拒否していると、その操作だけ失敗する
+(例: Send Messages がないとテキストへの記録は失敗するが、音声でのやり取りは続く)。
+
+### 5. 環境変数の設定
 
 ```bash
 cp .env.example .env
@@ -73,7 +105,7 @@ cp .env.example .env
 
 `.env` に以下を設定する:
 
-- `DISCORD_TOKEN` — Discord Developer PortalでBotを作成し取得
+- `DISCORD_TOKEN` — 手順4で発行したbotのトークン
 - `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` — 利用するOpenAI互換APIのAPIキー、ベースURL、モデルID
 - `LLM_API` (省略可) — `chat` (Chat Completions API、既定) か `responses` (Responses API)。
   モデルが対応しているエンドポイントに合わせる
@@ -86,11 +118,27 @@ cp .env.example .env
 - `VOICEVOX_SPEAKER_ID` — 使用する話者ID
 - `VOICEVOX_SPEED_SCALE` (省略可) — 読み上げの話速。1.0が標準で、既定は1.3
 
-### 5. 起動
+### 6. 起動
 
 ```bash
 python3 bot.py
 ```
+
+#### Docker Compose で起動する場合
+
+GPU (NVIDIA Container Toolkit) が使えるホストで、`.env` と `knowledge/` を用意してから起動する。
+VOICEVOX ENGINE (CPU版) も同じcomposeで起動するため、手順2・3は不要。
+
+```bash
+docker compose up -d
+```
+
+- イメージは `main` へのpushとタグ (`v*`) のpushで GitHub Actions がビルドし、
+  `ghcr.io/nananek/ktane-japanese-agent` に公開する (`.github/workflows/docker.yml`)。
+  ローカルでビルドする場合は `docker compose build`
+- `knowledge/` は非公開のため、イメージには含めず `/app/knowledge` に読み取り専用でマウントする
+- Whisperのモデルは `whisper-models` ボリュームに保存され、再作成時にダウンロードし直さない
+- 同じ `DISCORD_TOKEN` でbotを複数起動すると応答が重複するため、ホストで直接起動しているbotは止めておくこと
 
 Discord上でスラッシュコマンドが使える (他のbotと衝突しないよう `ktane-` 接頭辞付き)。
 
@@ -102,8 +150,7 @@ Discord上でスラッシュコマンドが使える (他のbotと衝突しな�
 - ゲーム終了が記録された後は `/ktane-newbomb` を実行するまで、受け付け音・文字起こし・応答をすべて止める
 - `/ktane-leave` — ボイスチャンネルから退出する
 
-起動時に参加中の各サーバーへコマンドを登録する。botの招待URLには `bot` と `applications.commands` の
-スコープが必要 (メッセージ本文は読まないので MESSAGE CONTENT INTENT は不要)。
+起動時に参加中の各サーバーへコマンドを登録する (招待に必要なスコープと権限は手順4を参照)。
 
 ## 既知の要検証・要調整ポイント (Phase 1〜3で実測しながら詰める)
 
