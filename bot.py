@@ -43,6 +43,13 @@ responder_tasks: dict[int, asyncio.Task] = {}
 text_post_tasks: dict[int, asyncio.Task] = {}
 # 応答生成中に新しい発話が届いたときに作り直す上限回数 (話し続けられても応答が返らなくならないように)
 MAX_REGENERATIONS = 2
+# 聞き返し。LLMに回すと「最初からやり直す」と解釈されることがあるため、直前の読み上げをそのまま繰り返す
+REPEAT_REQUEST_RE = re.compile(
+    r"(もう(一|1|いっ)(度|回|かい)|繰り返して|リピート|聞こえなかった|なんて(言った)?|何て(言った)?)"
+    r"(お願い(します)?|言って(ください)?|ください)?"
+)
+# 直前にbotが読み上げた内容 (聞き返し用)
+last_replies: dict[int, str] = {}
 FILLER_WORDS = {"", "ん", "んー", "んん", "あ", "あー", "あっ", "え", "えー", "えっと", "えーと", "あの", "あのー", "うーん", "ふむ"}
 LLM_FAILURE_REPLY = "すみません、応答が取れませんでした。もう一度言ってください。"
 # 読み上げ終了後も聞き取りを止めておく秒数 (スピーカーからの残響をbot自身の声として拾わないように)。
@@ -126,6 +133,7 @@ async def announce_opening(ctx: commands.Context) -> None:
     lock = utterance_locks.setdefault(ctx.guild.id, asyncio.Lock())
     async with lock:
         sessions.get_or_create(ctx.guild.id).add_assistant_message(opening_line)
+        last_replies[ctx.guild.id] = opening_line
         await ctx.send(f"🤖 {opening_line}")
         if ctx.voice_client is not None:
             await wait_voice_encryption_ready(ctx.voice_client)
@@ -171,6 +179,20 @@ def _log_post_error(task: asyncio.Task) -> None:
         logger.error("テキストチャンネルへの投稿に失敗しました", exc_info=task.exception())
 
 
+def is_repeat_request(text: str) -> bool:
+    return REPEAT_REQUEST_RE.fullmatch(re.sub(r"[\s。、,.!?！？〜…ー]", "", text)) is not None
+
+
+async def repeat_last_reply(ctx: commands.Context) -> None:
+    """直前の読み上げを繰り返す。応答中なら、その応答の読み上げが終わってから繰り返す。"""
+    lock = utterance_locks.setdefault(ctx.guild.id, asyncio.Lock())
+    async with lock:
+        reply = last_replies[ctx.guild.id]
+        post_in_background(ctx, f"🤖 {reply}")
+        if ctx.voice_client is not None:
+            await speak(ctx.voice_client, reply)
+
+
 def is_filler(text: str) -> bool:
     """意味を持たない言いよどみだけの発話か。「はい」「うん」は質問への答えになりうるので含めない。"""
     normalized = re.sub(r"[\s。、,.!?！？〜…]", "", text)
@@ -197,6 +219,12 @@ async def handle_utterance(ctx: commands.Context, user_id: int, pcm_16k) -> None
         if is_filler(text):
             # 「ん」「えーと」だけの発話に応答すると、直前の指示を繰り返すなど往復が無駄に増える
             logger.info("filler ignored: %s", text)
+            return
+        if is_repeat_request(text) and ctx.guild.id in last_replies:
+            logger.info("repeat requested: %s", text)
+            post_in_background(ctx, f"🎙️ {text}")
+            task = asyncio.create_task(repeat_last_reply(ctx))
+            task.add_done_callback(_log_utterance_error)
             return
         if not pending_texts.get(ctx.guild.id):
             pending_since[ctx.guild.id] = utterance_ended_at
@@ -260,6 +288,8 @@ async def respond_to_pending(ctx: commands.Context) -> None:
                     logger.info("solver: %s", output)
                     post_in_background(ctx, f"🧮 {output}")
             post_in_background(ctx, f"🤖 {reply}")
+            if reply and reply != LLM_FAILURE_REPLY:
+                last_replies[ctx.guild.id] = reply
 
             if ctx.voice_client is not None and reply:
                 await speak(ctx.voice_client, reply, since=pending_since.pop(ctx.guild.id, None))
